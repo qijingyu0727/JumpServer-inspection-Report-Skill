@@ -1,0 +1,4 @@
+interface:
+  display_name: "JumpServer Inspection Report"
+  short_description: "生成 JumpServer 巡检报告与推送载荷"
+  default_prompt: "Use $jumpserver-inspection-report to save or select a template, generate a JumpServer inspection report, and output the delivery payload or local schedule state."
