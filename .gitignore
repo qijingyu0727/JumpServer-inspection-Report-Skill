@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 .DS_Store
+.env
+.env.*
+!.env.example
 
 runtime/*
 !runtime/.gitkeep
+!runtime/profiles/
+runtime/profiles/*.env

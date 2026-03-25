@@ -1,63 +1,53 @@
-# 模板与报告结构
+# 模板与补全规则
 
-## 模板来源
+## Markdown 模板
 
 | 来源 | 路径 | 用途 |
 |---|---|---|
 | 用户模板 | `runtime/template.md` | `save-template` 默认写入位置 |
 | 内置日报模板 | `assets/templates/daily.md` | 默认巡检日报 |
-| 内置管理摘要模板 | `assets/templates/executive.md` | 面向领导或汇报场景 |
+| 内置管理摘要模板 | `assets/templates/executive.md` | 管理层摘要 |
 
-默认模板选择顺序：
+默认优先级：
 
 ```text
-runtime/template.md 存在 -> 使用用户模板
-否则 -> 使用 assets/templates/daily.md
+runtime/template.md -> assets/templates/daily.md
 ```
 
-也可以显式传入：
+## 文档模板补全
 
-- `--template-file daily`
-- `--template-file executive`
-- `--template-file /abs/path/to/template.md`
+`fill-template` 支持：
 
-## 模板模式
+- `docx`：优先保留原结构并回传 `docx`
+- `doc`：先转成 `docx` 再回填
+- `pdf`：提取文本结构后重建 `docx`
 
-### 1. 占位符模式
+规则：
 
-出现 `{{ field_name }}` 时走轻量渲染。当前稳定字段包括：
+- 先替换占位符，如 `{{ report_date }}`、`{{ executive_summary }}`
+- 新内置模板默认还会使用 `{{ report_range }}`、`{{ scope_name }}`、`{{ command_summary }}`、`{{ report_notices }}`
+- 模板已有关键章节时，优先在原位置补内容
+- 缺少的标准章节追加到文末
+- 默认输出目录：`runtime/filled_templates/`
 
-- `report_date`
-- `today_login_logs`
-- `asset_status`
-- `active_sessions`
-- `operate_logs`
-- `security_risk_summary`
-- `risk_level`
-- `executive_summary`
-- `key_findings`
-- `recommendations`
+## 标准章节
 
-### 2. 自然语言模式
-
-模板不含占位符时，脚本按 Markdown 章节拆分，并根据段落中的关键词自动路由到：
-
-- 登录异常/爆破风险
-- 资产状态/禁用资产/异常资产
-- 活跃会话/在线会话
-- 操作审计/危险操作
-- 风险统计/安全风险
+- 管理摘要
+- 巡检概览
+- 系统命令巡检
+- 关键发现
+- 登录情况
+- 活跃会话
+- 资产状态
+- 操作审计
+- 安全风险摘要
+- 巡检说明
+- 处置建议
 
 ## 推荐命令
 
 ```bash
-python3 scripts/jms_inspection.py save-template --content-file /path/to/template.md
-python3 scripts/jms_inspection.py generate --template-file daily
-python3 scripts/jms_inspection.py generate --template-file executive --date 2026-03-20
+python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.docx --org-name 生产组织
+python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.doc --output-file /tmp/report_filled.docx
+python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.pdf --all-orgs
 ```
-
-## 维护规则
-
-- 用户自定义模板默认只写入 `runtime/`，不覆盖 `assets/templates/`
-- 如果需要新增占位符，优先更新 `scripts/jms_inspection.py` 和本文件中的字段清单
-- 如果自然语言模板映射不足，优先增强章节识别逻辑，而不是让用户重写模板

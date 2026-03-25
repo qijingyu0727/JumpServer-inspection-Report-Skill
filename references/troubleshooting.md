@@ -1,48 +1,74 @@
 # 常见问题与排查
 
-## 配置缺失
+## 组织解析失败
 
 现象：
 
-- `generate` 或 `self-test` 直接返回 `API 调用失败，请检查配置`
-
-优先检查：
-
-- `JUMPSERVER_URL` 是否存在
-- Bearer 或 Signature 凭据是否成对存在
-- 目标环境是否允许当前 Token/Key 访问审计与资产接口
-
-## 模板找不到
-
-现象：
-
-- 报告生成前提示模板文件不存在
+- 指定 `--org-name` 后提示未找到或命中多个组织
 
 处理：
 
-- 不传 `--template-file` 时，脚本默认查找 `runtime/template.md`
-- 若用户模板不存在，会自动回退到 `assets/templates/daily.md`
-- 传了显式路径时，必须确保路径真实存在
+- 先执行 `list-orgs --profile <profile>`
+- 改用更精确的组织名称
+- 如果确实要全量统计，改用 `--all-orgs`
+
+## 缺少命令执行能力
+
+现象：
+
+- `host-usage` 或 `exec-commands` 提示缺少 `playwright`
+
+处理：
+
+- 先执行 `python3 scripts/jms_inspection.py ensure-deps exec`
+- 或执行 `python3 -m playwright install chromium`
+- 若开启了 `JMS_AUTO_INSTALL=true`，脚本会优先自动尝试安装
+
+## 数据库连接失败
+
+现象：
+
+- `legacy` 报告或数据库统计提示缺少 `cryptography`
+- MySQL 8 使用 `caching_sha2_password` / `sha256_password` 时无法连接
+
+处理：
+
+- 先执行 `python3 -m pip install -r requirements.txt`
+- 或执行 `python3 scripts/jms_inspection.py ensure-deps db`
+- 若仍失败，重点检查 DB 账号鉴权方式和 `DB_* / JMS_DB_*` 配置
+
+## 模板补全失败
+
+现象：
+
+- `.doc` 无法转换
+- `.pdf` 输出不是原格式
+
+处理：
+
+- `.doc` 依赖 `libreoffice/soffice`
+- `.pdf` 默认允许回退为 `docx`
+- 先执行 `python3 scripts/jms_inspection.py ensure-deps pdf`
 
 ## 数据为空或接口字段变化
 
 现象：
 
-- 报告能生成，但某章节显示“未查询到数据”或“接口不可用”
+- 报告或分析能生成，但章节为空
 
 处理：
 
-- 先运行 `self-test` 看各接口的 `*_error` 字段
-- 如果只是单个接口异常，保留降级输出，不要让整份报告失败
-- 若 JumpServer 字段名变化，优先补充 `extract_first(...)` 的兼容键
+- 先跑 `self-test`
+- 关注 `assets_error` / `login_logs_error` / `operate_logs_error`
+- 单个接口失败时脚本会降级，不应直接把整份报告打断
 
-## 定时任务误解
+## 单机“谁在使用”为空
 
 现象：
 
-- 用户以为执行 `setup-daily-push` 后就已经开始后台推送
+- `host-usage` 返回了 `uptime`，但没有会话记录
 
 处理：
 
-- 明确说明 `setup-daily-push` 只写本地状态
-- 真正常驻需要执行 `daemon`，并由外部守护保持进程存活
+- 该结果只依赖 JumpServer 审计 / 活跃会话
+- 没有活跃连接时，应视为“当前未发现会话”，不是脚本错误

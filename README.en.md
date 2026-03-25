@@ -1,84 +1,42 @@
-# JumpServer Inspection Report
+# JumpServer Inspection Toolbox
 
 [中文](README.md)
 
-`jumpserver-inspection-report` is an execution-oriented skill for JumpServer inspection reporting. It uses bundled scripts to generate Markdown daily reports, executive summaries, Feishu delivery payloads, and local schedule state for operations and after-sales workflows.
+`jumpserver-inspection-report` is now a JumpServer inspection toolbox for teams. It covers formal HTML/Markdown reports, login anomaly and Top N analysis, single-host usage checks, Word/PDF template filling, Feishu payload generation, and local schedule state. HTML reports now default to `legacy` so the full server-side and database-backed inspection dataset is used unless `--style modern` is explicitly requested.
 
-## Repository Layout
-
-```text
-.
-├── SKILL.md
-├── README.md
-├── README.en.md
-├── .gitignore
-├── agents/
-│   └── openai.yaml
-├── assets/
-│   └── templates/
-│       ├── daily.md
-│       └── executive.md
-├── references/
-│   ├── runtime.md
-│   ├── templates.md
-│   ├── delivery.md
-│   └── troubleshooting.md
-├── runtime/
-│   └── .gitkeep
-├── scripts/
-│   ├── jms_inspection.py
-│   └── load_probe.sh
-├── main.py
-└── requirements.txt
-```
-
-## What It Does
-
-- Generates inspection reports from JumpServer API data
-- Supports both placeholder templates and natural-language templates
-- Produces Feishu message payloads for an upper-layer sender
-- Stores local schedule state and supports a foreground daemon
-- Degrades gracefully when a single API endpoint fails
-
-## Runtime Requirements
-
-- Python 3
-- JumpServer URL and authentication environment variables
-
-Bearer mode:
+## Quick Start
 
 ```bash
-export JUMPSERVER_URL="https://your-jumpserver.example.com"
-export JUMPSERVER_TOKEN="your_token"
+python3 -m pip install -r requirements.txt
+mkdir -p runtime/profiles
+cp .env.example runtime/profiles/prod.env
+python3 scripts/jms_inspection.py list-orgs --profile prod
+python3 scripts/jms_inspection.py self-test --profile prod --date 2026-03-20 --org-name Production
+bin/jms-report prod 2026-03-20 html
 ```
 
-Signature mode:
+If you need command execution support, install the Playwright browser once:
 
 ```bash
-export JUMPSERVER_URL="https://your-jumpserver.example.com"
-export JUMPSERVER_KEY_ID="your_key_id"
-export JUMPSERVER_SECRET_ID="your_secret"
+python3 -m playwright install chromium
 ```
-
-The current implementation only uses Python standard library modules, so `requirements.txt` intentionally contains no third-party package entries.
 
 ## Common Commands
 
 ```bash
-python3 scripts/jms_inspection.py generate --date 2026-03-20
-python3 scripts/jms_inspection.py generate --template-file executive
-python3 scripts/jms_inspection.py save-template --content-file /path/to/template.md
-python3 scripts/jms_inspection.py send-payload --open-id ou_xxx
-python3 scripts/jms_inspection.py setup-daily-push --hour 8 --minute 0 --template-file daily
-python3 scripts/jms_inspection.py daemon --hour 8 --minute 0 --template-file runtime/template.md
-python3 scripts/jms_inspection.py self-test --date 2026-03-20
-python3 scripts/jms_inspection.py update-token
+python3 scripts/jms_inspection.py analyze --profile prod --from 2026-03-01 --to 2026-03-20 --type login-anomalies --org-name Production
+python3 scripts/jms_inspection.py analyze --profile prod --from 2026-03-01 --to 2026-03-20 --type top-users --all-orgs
+python3 scripts/jms_inspection.py analyze --profile prod --from 2026-03-20 --to 2026-03-20 --type host-usage --host 10.1.12.46 --org-name Production
+python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.docx --org-name Production
+python3 scripts/jms_inspection.py ensure-deps all
 ```
 
-## Documentation Entry Points
+## Notes
 
-- Execution boundaries and routing: `SKILL.md`
-- Runtime and environment: `references/runtime.md`
-- Template behavior: `references/templates.md`
-- Delivery and scheduling: `references/delivery.md`
-- Troubleshooting: `references/troubleshooting.md`
+- Formal reports still prefer `html`, and `legacy` is now the default HTML style
+- Analysis requests return structured markdown by default
+- Organization names are resolved by exact match or unique fuzzy match
+- Host "who is using it" checks rely on JumpServer sessions/audit data
+- `requirements.txt` now predeclares `PyMySQL[rsa]`, `cryptography`, `playwright`, `python-docx`, and `pypdf`
+- MySQL 8 `caching_sha2_password` / `sha256_password` authentication is covered by the RSA dependency path
+- Auto-installed fallback Python dependencies are still placed in `runtime/.venv`

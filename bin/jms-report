@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(dirname "$SCRIPT_DIR")"
+
+usage() {
+  cat <<'EOF'
+jms-report - JumpServer 巡检报告 CLI
+
+推荐用法（固定三个参数）:
+  jms-report <profile> <date> <format>
+
+示例:
+  jms-report prod 2026-03-20 html
+  jms-report /abs/path/to/prod.env 2026-03-20 markdown
+
+说明:
+  profile  环境 profile 名称，默认查找 runtime/profiles/<profile>.env；也可直接传 env 文件路径
+  date     巡检日期，格式 YYYY-MM-DD
+  format   输出格式，支持 html / markdown
+
+更多高级参数:
+  python3 scripts/jms_inspection.py report <profile> <date> <format> --org-name 生产组织
+  python3 scripts/jms_inspection.py report <profile> <date> <format> --all-orgs
+  python3 scripts/jms_inspection.py report <profile> <date> <format> --output-file /tmp/report.html
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 3 ]]; then
+  usage
+  exit 1
+fi
+
+exec python3 "$SKILL_DIR/scripts/jms_inspection.py" report "$@"
