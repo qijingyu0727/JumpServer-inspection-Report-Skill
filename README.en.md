@@ -4,17 +4,14 @@
 
 `jumpserver-inspection-report` is a JumpServer inspection toolbox for team use. It covers formal inspection reports, login anomaly and Top N analysis, single-host usage checks, Word/PDF template filling, Feishu payload generation, and local schedule state.
 
-HTML reports now default to `legacy`, which uses the full host-side and database-backed inspection dataset. Use `--style modern` only when you explicitly want the newer dashboard-style HTML.
+HTML reports now default to `legacy`, which renders the new full inspection edition with host-side and database-backed data. `modern` provides a lighter control-room brief in the same JumpServer-themed visual system.
 
 ## Copy/Paste Setup
 
 Install:
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m playwright install chromium
-mkdir -p runtime/profiles
-cp .env.example runtime/profiles/prod.env
+python3 scripts/jms_inspection.py bootstrap --profile prod
 ```
 
 Minimum config:
@@ -23,10 +20,18 @@ Minimum config:
 JUMPSERVER_URL=https://jumpserver.example.com
 JUMPSERVER_USERNAME=admin
 JUMPSERVER_PASSWORD=change_me
-JMS_EXEC_ASSET_NAME=10.1.12.46
+JumpServer_IP=10.1.12.46
 JMS_EXEC_ACCOUNT_NAME=root
 JMS_REPORT_STYLE=legacy
 JMS_AUTO_INSTALL=true
+```
+
+Optional for restricted networks:
+
+```ini
+HTTPS_PROXY=http://127.0.0.1:7890
+HTTP_PROXY=http://127.0.0.1:7890
+PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=180000
 ```
 
 If you do not want database discovery to rely on remote `/opt/jumpserver/config/config.txt`, also add:
@@ -48,10 +53,18 @@ python3 scripts/jms_inspection.py self-test --profile prod --date 2026-03-20
 bin/jms-report prod 2026-03-20 html
 ```
 
+Notes:
+
+- `bootstrap` installs `db + exec + docx` by default
+- If you also need PDF template filling, run `python3 scripts/jms_inspection.py bootstrap --profile prod --include-pdf`
+- This avoids blocking fresh installs on non-core `pdf/libreoffice` dependencies
+- `bootstrap` creates `runtime/profiles/prod.env` automatically and stores Chromium under `runtime/.playwright-browsers`
+- If Chromium downloads are timing out, add `HTTPS_PROXY/HTTP_PROXY` or `PLAYWRIGHT_DOWNLOAD_HOST` to the profile and rerun `bootstrap`
+
 ## Features
 
 - Formal inspection reports in `html` and `markdown`
-- Full `legacy` data path from JumpServer host inspection and database queries
+- Full `legacy` data path from JumpServer host inspection and database queries, now rendered in the new full-report layout
 - Analysis workflows for login anomalies, Top users/assets, and host usage
 - Template filling for `doc`, `docx`, and `pdf`
 - Feishu payload generation and local scheduling helpers
@@ -62,20 +75,13 @@ bin/jms-report prod 2026-03-20 html
 1. Install Python dependencies:
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 scripts/jms_inspection.py bootstrap --profile prod
 ```
 
-2. If you need command execution or host usage checks, install the Playwright browser once:
+2. If you also need PDF template filling:
 
 ```bash
-python3 -m playwright install chromium
-```
-
-3. Create a profile:
-
-```bash
-mkdir -p runtime/profiles
-cp .env.example runtime/profiles/prod.env
+python3 scripts/jms_inspection.py bootstrap --profile prod --include-pdf
 ```
 
 ## Minimum First-Run Config
@@ -86,16 +92,18 @@ Edit `runtime/profiles/prod.env` and set at least:
 JUMPSERVER_URL=https://jumpserver.example.com
 JUMPSERVER_USERNAME=admin
 JUMPSERVER_PASSWORD=change_me
-JMS_EXEC_ASSET_NAME=10.1.12.46
+JumpServer_IP=10.1.12.46
 JMS_EXEC_ACCOUNT_NAME=root
 ```
 
 Notes:
 
-- `JMS_EXEC_ASSET_NAME` should point to the JumpServer deployment host asset name or IP
+- `JumpServer_IP` should point to the JumpServer deployment host asset name or IP
 - `JMS_EXEC_ACCOUNT_NAME` is the account used to connect to that host
-- The default report style is `legacy`
+- The default report style is `legacy`, which means the full inspection edition
 - Database queries use `PyMySQL[rsa]`; MySQL 8 `caching_sha2_password` / `sha256_password` setups also require `cryptography`
+- `bootstrap` prints `pending_profile_keys` so the next missing onboarding inputs are explicit
+- The old key `JMS_EXEC_ASSET_NAME` is still supported for compatibility, but new setups should prefer `JumpServer_IP`
 
 ## Quick Validation
 
@@ -111,7 +119,7 @@ bin/jms-report prod 2026-03-20 html
 If the tool asks for org, host, or database config, write it back into the profile:
 
 ```bash
-python3 scripts/jms_inspection.py save-config --profile prod JMS_DEFAULT_ORG_NAME=Default JMS_EXEC_ASSET_NAME=10.1.12.46 JMS_EXEC_ACCOUNT_NAME=root
+python3 scripts/jms_inspection.py save-config --profile prod JMS_DEFAULT_ORG_NAME=Default JumpServer_IP=10.1.12.46 JMS_EXEC_ACCOUNT_NAME=root
 ```
 
 ## Common Workflows
@@ -149,8 +157,9 @@ python3 scripts/jms_inspection.py setup-daily-push --profile prod --org-name Pro
 
 ## Default Behavior
 
-- `html` is the recommended report output, and `legacy` is the default HTML style
-- `legacy` prefers `JMS_SYSTEM_TARGETS`; if absent, it falls back to `JMS_EXEC_ASSET_NAME / JMS_EXEC_ACCOUNT_NAME`
+- `html` is the recommended report output, and `legacy` is the default full-report HTML style
+- `legacy` prefers `JMS_SYSTEM_TARGETS`; if absent, it falls back to `JumpServer_IP / JMS_EXEC_ACCOUNT_NAME`
+- `modern` is the lighter summary/control brief style for mobile or short-form reporting
 - When one IP matches multiple assets, the tool prefers Host/Linux hints, URL hostname hints, account availability, and connectivity
 - Multi-org output shows an overall summary first, then per-org details
 - `report ... --from ... --to ...` still generates one summary report, not multiple daily splits
@@ -169,5 +178,19 @@ python3 scripts/jms_inspection.py setup-daily-push --profile prod --org-name Pro
 Notes:
 
 - If `JMS_AUTO_INSTALL=true` is enabled, the script still attempts automatic recovery for missing dependencies
+- Even if OpenClaw does not preinstall dependencies during skill installation, the script now tries to recover `pip` inside `runtime/.venv` before installing them
 - Auto-installed fallback Python packages are placed in `runtime/.venv`
+- Playwright browser binaries are stored in `runtime/.playwright-browsers`
+- Fresh-install dependency recovery now uses retries and longer browser download timeouts to reduce flaky Chromium setup failures
 - `.doc` to `.docx` conversion still depends on system-side `libreoffice/soffice`
+- For fresh installs, prefer `python3 scripts/jms_inspection.py bootstrap --profile <name>` instead of starting with `ensure-deps all`
+
+## Documentation
+
+- Skill routing: `SKILL.md`
+- Runtime and environment: `references/runtime.md`
+- Template filling: `references/templates.md`
+- Intent routing: `references/intent-routing.md`
+- Delivery and scheduling: `references/delivery.md`
+- Troubleshooting: `references/troubleshooting.md`
+- Layout and metadata: `references/metadata/repo-layout.md`

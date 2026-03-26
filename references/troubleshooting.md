@@ -17,12 +17,17 @@
 现象：
 
 - `host-usage` 或 `exec-commands` 提示缺少 `playwright`
+- OpenClaw 安装 skill 后，`runtime/.venv` 里只有 Python 没有 pip
 
 处理：
 
+- fresh install 先执行 `python3 scripts/jms_inspection.py bootstrap --profile prod`
 - 先执行 `python3 scripts/jms_inspection.py ensure-deps exec`
+- 或执行 `python3 scripts/jms_inspection.py ensure-deps all`
 - 或执行 `python3 -m playwright install chromium`
-- 若开启了 `JMS_AUTO_INSTALL=true`，脚本会优先自动尝试安装
+- 若开启了 `JMS_AUTO_INSTALL=true`，脚本会先尝试恢复 `runtime/.venv` 里的 pip，再自动补装依赖
+- Chromium 默认下载到 `runtime/.playwright-browsers`
+- 若浏览器下载超时，优先在 profile 中补 `HTTPS_PROXY/HTTP_PROXY` 或 `PLAYWRIGHT_DOWNLOAD_HOST` 后重新执行 `bootstrap`
 
 ## 数据库连接失败
 

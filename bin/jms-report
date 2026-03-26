@@ -20,6 +20,9 @@ jms-report - JumpServer 巡检报告 CLI
   date     巡检日期，格式 YYYY-MM-DD
   format   输出格式，支持 html / markdown
 
+fresh install 建议先执行:
+  python3 scripts/jms_inspection.py bootstrap --profile <profile>
+
 更多高级参数:
   python3 scripts/jms_inspection.py report <profile> <date> <format> --org-name 生产组织
   python3 scripts/jms_inspection.py report <profile> <date> <format> --all-orgs

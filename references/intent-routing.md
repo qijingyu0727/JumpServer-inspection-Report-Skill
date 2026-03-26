@@ -16,7 +16,7 @@
   - `JUMPSERVER_URL`
   - `JUMPSERVER_USERNAME`
   - `JUMPSERVER_PASSWORD`
-  - JumpServer 部署服务器的资产名或 IP，对应 `JMS_EXEC_ASSET_NAME`
+  - JumpServer 部署服务器的资产名或 IP，对应 `JumpServer_IP`
   - 连接该服务器的账号名，对应 `JMS_EXEC_ACCOUNT_NAME`，未说明时默认 `root`
 - 组织范围：`哪个组织` 还是 `全部组织`
 - profile：运行哪个环境
@@ -34,10 +34,10 @@
   - `python3 scripts/jms_inspection.py save-config --profile <profile> KEY=VALUE [KEY=VALUE ...]`
 - 常见落盘项：
   - 默认组织：`JUMPSERVER_ORG`、`JMS_DEFAULT_ORG_NAME`
-  - 命令巡检目标：`JMS_EXEC_ASSET_NAME`、`JMS_EXEC_ACCOUNT_NAME`
+  - 命令巡检目标：`JumpServer_IP`、`JMS_EXEC_ACCOUNT_NAME`
   - 旧版报告节点：`JMS_SYSTEM_TARGETS`
   - 数据库覆盖：`DB_*` 或 `JMS_DB_*`
-  - 首次确认 `JMS_EXEC_ASSET_NAME` 和 `JMS_EXEC_ACCOUNT_NAME` 后，也可以同步写一份 `JMS_SYSTEM_TARGETS`
+  - 首次确认 `JumpServer_IP` 和 `JMS_EXEC_ACCOUNT_NAME` 后，也可以同步写一份 `JMS_SYSTEM_TARGETS`
 
 ## 报告输出规则
 

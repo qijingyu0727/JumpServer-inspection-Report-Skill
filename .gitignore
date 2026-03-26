@@ -1,11 +1,26 @@
-__pycache__/
-*.pyc
+# OS / Editor
 .DS_Store
+.vscode/
+
+# Environment files
 .env
 .env.*
 !.env.example
 
+# Python caches / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pydeps/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Local runtime outputs
 runtime/*
 !runtime/.gitkeep
 !runtime/profiles/
+!runtime/profiles/.gitkeep
 runtime/profiles/*.env

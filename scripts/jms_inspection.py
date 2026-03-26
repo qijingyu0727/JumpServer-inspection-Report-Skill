@@ -31,6 +31,9 @@ DEFAULT_REPORT_STYLE = "legacy"
 DEFAULT_COMMAND_TIMEOUT = 20
 DEFAULT_COMMAND_MAX_OUTPUT = 12000
 DEFAULT_TOP_N = 10
+DEFAULT_INSTALL_RETRIES = 3
+DEFAULT_PIP_TIMEOUT = 120
+DEFAULT_PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS = 180000
 ROOT_ORG_ID = "00000000-0000-0000-0000-000000000000"
 ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1B\][^\x07]*(?:\x07|\x1B\\)")
@@ -56,6 +59,7 @@ TEMPLATE_DIR = ASSETS_DIR / "templates"
 RUNTIME_DIR = SKILL_DIR / "runtime"
 PROFILE_DIR = RUNTIME_DIR / "profiles"
 REPORT_DIR = RUNTIME_DIR / "reports"
+EXAMPLE_ENV_FILE = SKILL_DIR / ".env.example"
 
 BUILTIN_DAILY_TEMPLATE_FILE = TEMPLATE_DIR / "daily.md"
 BUILTIN_EXECUTIVE_TEMPLATE_FILE = TEMPLATE_DIR / "executive.md"
@@ -64,6 +68,7 @@ DEFAULT_STATE_FILE = RUNTIME_DIR / "scheduler_state.json"
 DEFAULT_OUTPUT_FILE = RUNTIME_DIR / "last_report.md"
 DEFAULT_HTML_OUTPUT_FILE = RUNTIME_DIR / "last_report.html"
 RUNTIME_VENV_DIR = RUNTIME_DIR / ".venv"
+PLAYWRIGHT_BROWSERS_DIR = RUNTIME_DIR / ".playwright-browsers"
 FILLED_TEMPLATE_DIR = RUNTIME_DIR / "filled_templates"
 LEGACY_COMMAND_FILE = COMMANDS_DIR / "legacy_system.txt"
 DEFAULT_REMOTE_CONFIG_FILE = "/opt/jumpserver/config/config.txt"
@@ -116,6 +121,55 @@ def bootstrap_runtime_site_packages() -> None:
 
 
 bootstrap_runtime_site_packages()
+
+
+def apply_runtime_env_defaults() -> None:
+    PLAYWRIGHT_BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_DIR))
+    os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    os.environ.setdefault("PIP_DEFAULT_TIMEOUT", str(DEFAULT_PIP_TIMEOUT))
+    os.environ.setdefault("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", str(DEFAULT_PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS))
+
+
+def build_runtime_process_env(extra: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    apply_runtime_env_defaults()
+    env = {str(key): str(value) for key, value in os.environ.items()}
+    for key, value in (RUNTIME_PROFILE.get("values") or {}).items():
+        if value is None:
+            continue
+        env[str(key)] = str(value)
+    env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_DIR))
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    env.setdefault("PIP_DEFAULT_TIMEOUT", str(DEFAULT_PIP_TIMEOUT))
+    env.setdefault("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", str(DEFAULT_PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS))
+    if extra:
+        for key, value in extra.items():
+            if value is None:
+                continue
+            env[str(key)] = str(value)
+    return env
+
+
+def run_subprocess(command: List[str], description: str, retries: int = 1, env: Optional[Dict[str, str]] = None) -> None:
+    attempts = max(int(retries or 1), 1)
+    last_error: Optional[subprocess.CalledProcessError] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(command, check=True, env=env)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                command_text = " ".join(command)
+                raise JumpServerApiError(
+                    f"{description} 失败（已尝试 {attempts} 次，退出码 {exc.returncode}）：{command_text}"
+                ) from exc
+            time.sleep(min(2 ** (attempt - 1), 5))
+    if last_error is not None:
+        raise JumpServerApiError(str(last_error))
+
+
+apply_runtime_env_defaults()
 
 
 class JumpServerApiError(RuntimeError):
@@ -255,6 +309,48 @@ def resolve_profile_write_file(profile: Optional[str] = None) -> Path:
     if profile_source:
         return Path(str(profile_source)).resolve()
     raise JumpServerApiError("当前没有可写的 profile 文件，请显式传入 --profile。")
+
+
+def ensure_profile_from_example(profile: str, overwrite: bool = False) -> Tuple[Path, bool]:
+    path = resolve_profile_write_file(profile)
+    if path.exists() and not overwrite:
+        return path, False
+    if not EXAMPLE_ENV_FILE.exists():
+        raise FileNotFoundError(f"示例环境文件不存在：{EXAMPLE_ENV_FILE}")
+    ensure_parent_dir(path)
+    shutil.copyfile(EXAMPLE_ENV_FILE, path)
+    return path, True
+
+
+def bootstrap_required_profile_keys() -> List[str]:
+    return [
+        "JUMPSERVER_URL",
+        "JUMPSERVER_USERNAME",
+        "JUMPSERVER_PASSWORD",
+        "JumpServer_IP",
+        "JMS_EXEC_ACCOUNT_NAME",
+    ]
+
+
+def detect_pending_profile_keys(path: Optional[Path]) -> List[str]:
+    if not path or not path.exists():
+        return bootstrap_required_profile_keys()
+
+    values = parse_env_file(path)
+    jumpserver_ip = str(values.get("JumpServer_IP") or values.get("JUMPSERVER_IP") or values.get("JMS_EXEC_ASSET_NAME") or "").strip()
+    placeholder_values = {
+        "JUMPSERVER_URL": {"", "https://jumpserver.example.com"},
+        "JUMPSERVER_USERNAME": {"", "admin"},
+        "JUMPSERVER_PASSWORD": {"", "change_me"},
+        "JumpServer_IP": {"", "jumpserver-host"},
+        "JMS_EXEC_ACCOUNT_NAME": {"", "root"},
+    }
+    pending: List[str] = []
+    for key in bootstrap_required_profile_keys():
+        value = jumpserver_ip if key == "JumpServer_IP" else str(values.get(key, "")).strip()
+        if value in placeholder_values.get(key, {""}):
+            pending.append(key)
+    return pending
 
 
 def persist_runtime_settings(updates: Dict[str, str], profile: Optional[str] = None) -> Path:
@@ -534,6 +630,14 @@ def is_placeholder_asset_name(value: str) -> bool:
     }
 
 
+def get_jumpserver_ip_value() -> str:
+    for key in ("JumpServer_IP", "JUMPSERVER_IP", "JMS_EXEC_ASSET_NAME"):
+        value = get_runtime_env(key)
+        if value:
+            return value
+    return ""
+
+
 def resolve_service_host_info() -> Dict[str, str]:
     cfg = get_env_config()
     parsed = urllib.parse.urlparse(cfg["base_url"])
@@ -555,7 +659,7 @@ def resolve_service_host_info() -> Dict[str, str]:
 
 
 def infer_default_asset_name() -> str:
-    explicit = get_runtime_env("JMS_EXEC_ASSET_NAME")
+    explicit = get_jumpserver_ip_value()
     if explicit and not is_placeholder_asset_name(explicit):
         return explicit
     info = resolve_service_host_info()
@@ -762,16 +866,22 @@ def scope_label(org_scopes: List[Dict[str, str]]) -> str:
     return "全部组织"
 
 
-def get_command_execution_error() -> Optional[str]:
-    state = get_command_target_state()
-    if state.get("error"):
-        return str(state["error"])
-    if not state.get("targets"):
+def get_command_execution_error(targets: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    resolved_targets = targets
+    if resolved_targets is None:
+        state = get_command_target_state()
+        if state.get("error"):
+            return str(state["error"])
+        resolved_targets = list(state.get("targets") or [])
+    if not resolved_targets:
         return None
     try:
         get_env_config()
+        ensure_command_runtime_ready()
         return None
     except JumpServerApiError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001
         return str(exc)
 
 
@@ -1228,7 +1338,7 @@ def resolve_exact_asset_id(
 ) -> Tuple[str, str]:
     matches = find_matching_assets(asset_name, org_id=org_id)
     if not matches:
-        raise JumpServerApiError(f"`JMS_EXEC_ASSET_NAME={asset_name}` 未找到匹配资产。")
+        raise JumpServerApiError(f"`JumpServer_IP={asset_name}` 未找到匹配资产。")
     if len(matches) > 1:
         picked = choose_best_asset_match(asset_name, matches, account_name=account_name, org_id=org_id, prefer_host=prefer_host)
         if picked is not None:
@@ -1237,7 +1347,7 @@ def resolve_exact_asset_id(
             f"{humanize_value(item.get('name'), default='-')}[{humanize_value(item.get('address'), default='-')}]"
             for item in matches[:5]
         )
-        raise JumpServerApiError(f"`JMS_EXEC_ASSET_NAME={asset_name}` 命中多台资产，请改成更精确名称。候选：{names}")
+        raise JumpServerApiError(f"`JumpServer_IP={asset_name}` 命中多台资产，请改成更精确名称。候选：{names}")
     asset = matches[0]
     return str(asset.get("id", "")).strip(), humanize_value(asset.get("name"), default=asset_name)
 
@@ -1382,7 +1492,7 @@ def build_command_target_state() -> Dict[str, Any]:
             resolution_mode = "explicit_id"
             targets.append(target)
         elif target.get("asset_name") and target.get("account_name"):
-            resolution_mode = "url_inferred" if is_placeholder_asset_name(get_runtime_env("JMS_EXEC_ASSET_NAME")) else "name_match"
+            resolution_mode = "url_inferred" if is_placeholder_asset_name(get_jumpserver_ip_value()) else "name_match"
             targets.append(target)
 
     if not targets:
@@ -1394,7 +1504,7 @@ def build_command_target_state() -> Dict[str, Any]:
         if not item.get("asset"):
             asset_name = item.get("asset_name", "").strip()
             if not asset_name:
-                raise JumpServerApiError("未配置 `JMS_EXEC_ASSET_NAME`，无法自动解析命令巡检目标资产。")
+                raise JumpServerApiError("未配置 `JumpServer_IP`，无法自动解析命令巡检目标资产。")
             item["asset"], asset_display = resolve_exact_asset_id(
                 asset_name,
                 account_name=item.get("account_name", "").strip(),
@@ -1671,14 +1781,41 @@ def runtime_python() -> Path:
     return RUNTIME_VENV_DIR / "bin" / "python3"
 
 
+def runtime_pip_ready(python_path: Path) -> bool:
+    try:
+        subprocess.run(
+            [str(python_path), "-m", "pip", "--version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def ensure_runtime_pip(python_path: Path) -> None:
+    if runtime_pip_ready(python_path):
+        return
+    try:
+        run_subprocess([str(python_path), "-m", "ensurepip", "--upgrade"], "恢复 runtime/.venv 中的 pip")
+    except Exception as exc:  # noqa: BLE001
+        raise JumpServerApiError(
+            "runtime/.venv 缺少 pip，且无法通过 ensurepip 自动恢复，请检查当前 Python 是否包含 venv/ensurepip。"
+        ) from exc
+    if not runtime_pip_ready(python_path):
+        raise JumpServerApiError("runtime/.venv 中的 pip 恢复失败，请重新初始化运行环境后重试。")
+
+
 def ensure_runtime_venv() -> Path:
     python_path = runtime_python()
-    if python_path.exists():
-        return python_path
-    ensure_parent_dir(RUNTIME_VENV_DIR / ".keep")
-    subprocess.run([sys.executable, "-m", "venv", str(RUNTIME_VENV_DIR)], check=True)
+    if not python_path.exists():
+        ensure_parent_dir(RUNTIME_VENV_DIR / ".keep")
+        run_subprocess([sys.executable, "-m", "venv", str(RUNTIME_VENV_DIR)], "创建 runtime/.venv")
+        python_path = runtime_python()
+    ensure_runtime_pip(python_path)
     bootstrap_runtime_site_packages()
-    return runtime_python()
+    return python_path
 
 
 def detect_package_manager() -> Optional[List[str]]:
@@ -1711,39 +1848,94 @@ def ensure_dependency_group(group: str) -> Dict[str, Any]:
 
     spec = OPTIONAL_DEPENDENCIES[group]
     python_path = ensure_runtime_venv()
+    install_env = build_runtime_process_env()
     installed_python: List[str] = []
     installed_system: List[str] = []
     post_steps: List[str] = []
 
     if spec["python"]:
-        subprocess.run([str(python_path), "-m", "pip", "install", *spec["python"]], check=True)
+        run_subprocess(
+            [str(python_path), "-m", "pip", "install", *spec["python"]],
+            f"安装 `{group}` Python 依赖",
+            retries=DEFAULT_INSTALL_RETRIES,
+            env=install_env,
+        )
         installed_python.extend(spec["python"])
     for package in spec["system"]:
         if shutil.which(package):
             continue
         installed_system.append(install_system_package(package))
     for step in spec["post_install"]:
-        subprocess.run([str(python_path), *step], check=True)
+        run_subprocess(
+            [str(python_path), *step],
+            f"执行 `{group}` 后置安装",
+            retries=DEFAULT_INSTALL_RETRIES,
+            env=install_env,
+        )
         post_steps.append(" ".join(step))
 
     bootstrap_runtime_site_packages()
+    if group == "exec":
+        RUNTIME_PROFILE["command_runtime_ready"] = None
     return {
         "group": group,
         "python_packages": installed_python,
         "system_actions": installed_system,
         "post_install": post_steps,
         "venv": str(RUNTIME_VENV_DIR),
+        "playwright_browsers_path": str(PLAYWRIGHT_BROWSERS_DIR) if group == "exec" else None,
+    }
+
+
+def ensure_dependency_groups(groups: List[str]) -> Dict[str, Any]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if group not in OPTIONAL_DEPENDENCIES:
+            raise JumpServerApiError(f"未知依赖组：{group}")
+        if group in seen:
+            continue
+        seen.add(group)
+        normalized.append(group)
+    results = [ensure_dependency_group(group) for group in normalized]
+    return {"target": ",".join(normalized), "results": results}
+
+
+def bootstrap_dependency_groups(groups: List[str]) -> Dict[str, Any]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if group not in OPTIONAL_DEPENDENCIES:
+            raise JumpServerApiError(f"未知依赖组：{group}")
+        if group in seen:
+            continue
+        seen.add(group)
+        normalized.append(group)
+
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, str]] = []
+    for group in normalized:
+        try:
+            results.append(ensure_dependency_group(group))
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) or DEFAULT_ERROR_MESSAGE
+            results.append({"group": group, "error": message})
+            failures.append({"group": group, "error": message})
+    return {
+        "target": ",".join(normalized),
+        "results": results,
+        "failed_groups": [item["group"] for item in failures],
+        "failures": failures,
     }
 
 
 def ensure_dependencies(target: str) -> Dict[str, Any]:
     groups = list(OPTIONAL_DEPENDENCIES) if target == "all" else [target]
-    results = [ensure_dependency_group(group) for group in groups]
-    return {"target": target, "results": results}
+    return ensure_dependency_groups(groups)
 
 
 def maybe_auto_install(target: str) -> None:
-    if parse_bool_env("JMS_AUTO_INSTALL", False):
+    if parse_bool_env("JMS_AUTO_INSTALL", True):
         ensure_dependencies(target)
 
 
@@ -1781,8 +1973,18 @@ def launch_chromium(playwright: Any):
             return playwright.chromium.launch(headless=True)
         except Exception as install_exc:  # noqa: BLE001
             raise JumpServerApiError(
-                "命令执行依赖 Chromium 浏览器，请先执行 `python3 -m playwright install chromium` 或 `python3 scripts/jms_inspection.py ensure-deps exec`。"
+                "命令执行依赖 Chromium 浏览器，请先执行 `python3 scripts/jms_inspection.py bootstrap --profile <profile>` 或 `python3 scripts/jms_inspection.py ensure-deps exec`；若下载超时，请补充代理或 `PLAYWRIGHT_DOWNLOAD_HOST` 后重试。"
             ) from install_exc
+
+
+def ensure_command_runtime_ready() -> None:
+    if RUNTIME_PROFILE.get("command_runtime_ready") is True:
+        return
+    sync_playwright = get_playwright_sync()
+    with sync_playwright() as playwright:
+        browser = launch_chromium(playwright)
+        browser.close()
+    RUNTIME_PROFILE["command_runtime_ready"] = True
 
 
 def capture_terminal_text(page: Any) -> str:
@@ -2098,7 +2300,7 @@ def run_commands_via_browser(token_id: str, commands: List[str], timeout_seconds
 
 def collect_command_evidence(targets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     evidence: List[Dict[str, Any]] = []
-    precheck_error = get_command_execution_error()
+    precheck_error = get_command_execution_error(targets)
     if precheck_error:
         for target in targets:
             evidence.append({
@@ -3668,6 +3870,32 @@ def render_metric_cards(cards: List[Tuple[str, Any]]) -> str:
     )
 
 
+def render_anchor_nav(items: List[Tuple[str, str]]) -> str:
+    normalized = [(anchor.strip(), label.strip()) for anchor, label in items if anchor and label]
+    if not normalized:
+        return ""
+    links = "".join(
+        f'<a class="anchor-link" href="#{escape(anchor)}">{escape(label)}</a>'
+        for anchor, label in normalized
+    )
+    return f'<nav class="anchor-nav" aria-label="报告导航">{links}</nav>'
+
+
+def render_summary_callouts(items: List[Tuple[str, str]]) -> str:
+    normalized = [(label.strip(), copy.strip()) for label, copy in items if label and copy]
+    if not normalized:
+        return ""
+    cards = []
+    for label, copy in normalized:
+        cards.append(
+            '<article class="summary-card">'
+            f'<div class="summary-label">{escape(label)}</div>'
+            f'<div class="summary-copy">{escape(copy)}</div>'
+            '</article>'
+        )
+    return '<div class="summary-board">' + "".join(cards) + "</div>"
+
+
 def render_risk_badge(level: str) -> str:
     normalized = str(level or "").strip()
     class_name = {
@@ -3742,15 +3970,27 @@ def render_legacy_html_report(
         date_to=date_to,
     )
     metadata = context["metadata"]
+    bundle = context["bundle"]
     report_version = context.get("legacy_version") or metadata["version"]
     operations = context["operations_summary"]
     db_metrics = context["db_metrics"]
     snapshots = context["system_snapshots"]
+    risk_level = bundle["risk_level"]
     asset_type_text = "、".join(f"{item['name']}（{item['value']}）" for item in operations["asset_type_top3"]) or "无"
     explicit_range = context["date_from"] != context["date_to"]
     period_short_label = "查询区间" if explicit_range else "近一月"
     period_long_label = "查询区间" if explicit_range else "近三月"
     trend_label = "按时间区间" if explicit_range else "按周"
+    dispatch_message = {
+        "高": "本次完整版巡检已识别出高优先级风险，建议立即复核节点状态、异常来源与高危操作链路。",
+        "中": "平台存在需要持续跟进的异常项，建议按登录、节点健康和数据库指标逐项收敛。",
+        "低": "整体运行态较为平稳，建议保持日报归档、抽样复核与告警联动。",
+    }.get(risk_level, "请结合本次巡检结果继续完成后续复核与处置。")
+    coverage_summary = (
+        f"本次正式巡检覆盖 {escape(metadata['scope_name'])}，统计区间 {escape(context['date_from'])} 至 {escape(context['date_to'])}。"
+        f"已纳管资产 {operations['asset_count']} 台，在线会话 {operations['online_sessions']} 条，"
+        f"JumpServer 版本 {escape(report_version)}，节点角色覆盖 {escape('、'.join(sorted({str(item.get('role') or '-') for item in snapshots}) or ['jumpserver']))}。"
+    )
 
     operation_rows = [
         {"metric": "软件版本", "value": report_version},
@@ -3766,34 +4006,80 @@ def render_legacy_html_report(
         {"metric": f"{period_long_label}平均会话时长", "value": format_seconds(operations["avg_session_seconds_90d"])},
         {"metric": f"{period_long_label}工单申请数", "value": operations["ticket_requests_90d"]},
     ]
+    overview_cards = [
+        ("风险等级", risk_level),
+        ("纳管资产", operations["asset_count"]),
+        ("在线会话", operations["online_sessions"]),
+        ("组织数", operations["org_count"]),
+        ("用户数", operations["user_count"]),
+        ("巡检节点", len(context["overview_targets"])),
+        ("最大单日登录", operations["max_daily_login_count"]),
+        ("高危命令", operations["dangerous_command_records_90d"]),
+    ]
+
+    notice_items = list(bundle.get("report_notice_items", []))
+    if context.get("system_error"):
+        notice_items.append(f"系统命令采集异常：{context['system_error']}")
+    if context.get("users_error"):
+        notice_items.append(f"用户接口异常：{context['users_error']}")
+    if context.get("db_error"):
+        notice_items.append(f"数据库统计采集失败：{context['db_error']}")
+    section_nav = [
+        ("overview", "总览与态势"),
+        ("ops", "数据库与运营"),
+        ("nodes", "节点巡检"),
+        ("audit", "审计与建议"),
+    ]
+    summary_callouts = [
+        ("建议先看", dispatch_message),
+        ("首个异常", context["anomaly_rows"][0]["description"] if context["anomaly_rows"] else "当前未发现需要升级处理的异常。"),
+        ("建议动作", bundle["recommendation_items"][0] if bundle["recommendation_items"] else "当前建议保持日巡检与异常联动。"),
+    ]
 
     system_blocks = []
     for index, snapshot in enumerate(snapshots, start=1):
         component_status_block = (
-            render_html_table(
+            render_html_table_block(
                 [("组件", "name"), ("服务", "service"), ("状态", "status"), ("端口", "ports"), ("镜像", "image")],
                 snapshot["component_status_structured_rows"],
                 "未采集到 jmsctl 状态。",
             )
             if snapshot["component_status_structured_rows"]
-            else render_html_table([("状态明细", "item")], snapshot["component_status_rows"], "未采集到 jmsctl 状态。")
+            else render_html_table_block([("状态明细", "item")], snapshot["component_status_rows"], "未采集到 jmsctl 状态。")
         )
         component_rows_block = (
             ""
             if snapshot["component_status_structured_rows"]
             else f"""
-              <h3>JumpServer 服务组件状态</h3>
-              {render_html_table([("组件", "name"), ("状态", "status"), ("端口", "ports")], snapshot["component_rows"], "未采集到容器状态。")}
+              <section class="subpanel">
+                <h3>JumpServer 服务组件状态</h3>
+                <p class="subpanel-summary">当未获取到结构化 `jmsctl` 结果时，回退展示容器状态概览。</p>
+                {render_html_table_block([("组件", "name"), ("状态", "status"), ("端口", "ports")], snapshot["component_rows"], "未采集到容器状态。")}
+              </section>
             """
         )
         system_blocks.append(
             f"""
-            <section class="legacy-card">
-              <h2>{index}. {escape(snapshot['name'])} 节点巡检</h2>
-              <div class="legacy-grid">
-                <div>
+            <article class="panel panel-strong span-12 legacy-node-card">
+              <div class="panel-body">
+                <div class="node-header">
+                  <div>
+                    <p class="panel-kicker">Node {index:02d}</p>
+                    <h2>{escape(snapshot['name'])} 节点巡检</h2>
+                    <p class="panel-summary">覆盖主机基础信息、组件状态、磁盘、容器内存、高内存进程和大文件检查，适合正式巡检归档。</p>
+                  </div>
+                  <div class="runtime-list">
+                    <span class="runtime-pill">角色：{escape(humanize_value(snapshot.get('role'), default='-'))}</span>
+                    <span class="runtime-pill">主机名：{escape(humanize_value(snapshot['system_info']['hostname'], default='-'))}</span>
+                    <span class="runtime-pill">系统：{escape(humanize_value(snapshot['system_info']['os'], default='-'))}</span>
+                    <span class="runtime-pill">版本：{escape(humanize_value(snapshot['system_info']['app_version'], default='-'))}</span>
+                  </div>
+                </div>
+                <div class="legacy-grid">
+                  <section class="subpanel">
                   <h3>系统信息</h3>
-                  {render_html_table([("字段", "field"), ("值", "value")], make_field_rows([
+                  <p class="subpanel-summary">节点当前基础信息、内核版本与运行时长。</p>
+                  {render_html_table_block([("字段", "field"), ("值", "value")], make_field_rows([
                     ("主机名", snapshot["system_info"]["hostname"]),
                     ("系统版本", snapshot["system_info"]["os"]),
                     ("JumpServer 版本", snapshot["system_info"]["app_version"]),
@@ -3802,176 +4088,1153 @@ def render_legacy_html_report(
                     ("当前时间", snapshot["system_info"]["current_time"]),
                     ("运行时长", snapshot["system_info"]["uptime"]),
                   ]))}
-                </div>
-                <div>
+                  </section>
+                  <section class="subpanel">
                   <h3>CPU 信息</h3>
-                  {render_html_table([("字段", "field"), ("值", "value")], make_field_rows([
+                  <p class="subpanel-summary">用于判断节点核数、架构和 CPU 型号是否符合部署预期。</p>
+                  {render_html_table_block([("字段", "field"), ("值", "value")], make_field_rows([
                     ("物理 CPU 个数", snapshot["cpu_info"]["sockets"]),
                     ("每物理 CPU 核数", snapshot["cpu_info"]["cores_per_socket"]),
                     ("逻辑 CPU 核数", snapshot["cpu_info"]["logical_cpus"]),
                     ("CPU 型号", snapshot["cpu_info"]["model"]),
                   ]))}
-                </div>
-              </div>
-              <div class="legacy-grid">
-                <div>
+                  </section>
+                  <section class="subpanel">
                   <h3>内存信息</h3>
-                  {render_html_table([("字段", "field"), ("值", "value")], make_field_rows([
+                  <p class="subpanel-summary">观察物理内存、空闲量与交换空间使用情况。</p>
+                  {render_html_table_block([("字段", "field"), ("值", "value")], make_field_rows([
                     ("总量", snapshot["memory_info"]["total"]),
                     ("已用", snapshot["memory_info"]["used"]),
                     ("空闲", snapshot["memory_info"]["free"]),
                     ("SWAP", snapshot["memory_info"]["swap"]),
                   ]))}
-                </div>
-                <div>
+                  </section>
+                  <section class="subpanel">
                   <h3>其他系统参数</h3>
-                  {render_html_table([("字段", "field"), ("值", "value")], make_field_rows([
+                  <p class="subpanel-summary">补充展示负载、防火墙与僵尸进程等系统态势。</p>
+                  {render_html_table_block([("字段", "field"), ("值", "value")], make_field_rows([
                     ("防火墙", snapshot["system_params"]["firewall"]),
                     ("平均负载", snapshot["system_params"]["loadavg"]),
                     ("CPU 数量", snapshot["cpu_count"]),
                     ("僵尸进程", snapshot["system_params"]["zombie_processes"]),
                   ]))}
+                  </section>
+                  <section class="subpanel full">
+                    <h3>jmsctl 组件状态</h3>
+                    <p class="subpanel-summary">优先展示结构化的服务状态、端口与镜像信息。</p>
+                    {component_status_block}
+                  </section>
+                  {component_rows_block}
+                  <section class="subpanel">
+                    <h3>防火墙策略</h3>
+                    <p class="subpanel-summary">记录节点当前防火墙配置，便于后续变更对比。</p>
+                    {render_html_table_block([("策略明细", "item")], parse_key_value_lines(snapshot["system_params"]["firewall_rules"]), "未采集到防火墙策略。")}
+                  </section>
+                  <section class="subpanel">
+                    <h3>僵尸进程明细</h3>
+                    <p class="subpanel-summary">用于快速识别异常退出后未正确回收的进程。</p>
+                    {render_html_table_block([("进程明细", "item")], parse_key_value_lines(snapshot["system_params"]["zombie_detail"]), "未发现僵尸进程明细。")}
+                  </section>
+                  <section class="subpanel">
+                    <h3>容器内存占用</h3>
+                    <p class="subpanel-summary">聚焦核心组件内存使用情况，适合做容量趋势对照。</p>
+                    {render_html_table_block([("组件", "name"), ("内存占用", "usage")], snapshot["container_memory_rows"], "未采集到容器内存占用。")}
+                  </section>
+                  <section class="subpanel full">
+                    <h3>磁盘信息</h3>
+                    <p class="subpanel-summary">展示各文件系统容量与使用率，优先关注高水位挂载点。</p>
+                    {render_html_table_block([("节点", "target_name"), ("文件系统", "filesystem"), ("类型", "type"), ("总量", "size"), ("已用", "used"), ("可用", "avail"), ("使用率", "usage"), ("挂载点", "mount")], snapshot["disk_rows"], "未采集到磁盘信息。")}
+                  </section>
+                  <section class="subpanel full">
+                    <h3>高内存进程 Top 10</h3>
+                    <p class="subpanel-summary">辅助定位内存热点进程与潜在异常占用。</p>
+                    {render_html_table_block([("用户", "user"), ("PID", "pid"), ("%CPU", "cpu"), ("%MEM", "mem"), ("RSS", "rss"), ("命令", "command")], snapshot["top_memory_rows"], "未采集到高内存进程列表。")}
+                  </section>
+                  <section class="subpanel full">
+                    <h3>大文件巡检</h3>
+                    <p class="subpanel-summary">用于排查日志、缓存或临时文件异常膨胀。</p>
+                    {render_html_table_block([("大小", "size"), ("路径", "path")], snapshot["large_file_rows"], "未采集到大文件列表。")}
+                  </section>
                 </div>
               </div>
-              <h3>防火墙策略</h3>
-              {render_html_table([("策略明细", "item")], parse_key_value_lines(snapshot["system_params"]["firewall_rules"]), "未采集到防火墙策略。")}
-              <h3>僵尸进程明细</h3>
-              {render_html_table([("进程明细", "item")], parse_key_value_lines(snapshot["system_params"]["zombie_detail"]), "未发现僵尸进程明细。")}
-              <h3>jmsctl 组件状态</h3>
-              {component_status_block}
-              {component_rows_block}
-              <h3>容器内存占用</h3>
-              {render_html_table([("组件", "name"), ("内存占用", "usage")], snapshot["container_memory_rows"], "未采集到容器内存占用。")}
-              <h3>磁盘信息</h3>
-              {render_html_table([("节点", "target_name"), ("文件系统", "filesystem"), ("类型", "type"), ("总量", "size"), ("已用", "used"), ("可用", "avail"), ("使用率", "usage"), ("挂载点", "mount")], snapshot["disk_rows"], "未采集到磁盘信息。")}
-              <h3>高内存进程 Top 10</h3>
-              {render_html_table([("用户", "user"), ("PID", "pid"), ("%CPU", "cpu"), ("%MEM", "mem"), ("RSS", "rss"), ("命令", "command")], snapshot["top_memory_rows"], "未采集到高内存进程列表。")}
-              <h3>大文件巡检</h3>
-              {render_html_table([("大小", "size"), ("路径", "path")], snapshot["large_file_rows"], "未采集到大文件列表。")}
-            </section>
+            </article>
             """
         )
 
-    db_notice = ""
-    if context.get("db_error"):
-        db_notice = f'<div class="notice error">数据库统计采集失败：{escape(context["db_error"])}</div>'
-    system_notice = ""
-    if context.get("system_error"):
-        system_notice = f'<div class="notice error">系统命令采集异常：{escape(context["system_error"])}</div>'
-    if context.get("users_error"):
-        system_notice += f'<div class="notice error">用户接口异常：{escape(context["users_error"])}</div>'
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(metadata['title'])}</title>
+  <style>
+    :root {{
+      --accent: {escape(metadata['theme_color'])};
+      --accent-bright: #d9f0e8;
+      --bg: linear-gradient(180deg, #e6eeea 0%, #eef5f2 42%, #f5f8f7 100%);
+      --paper: rgba(255, 255, 255, 0.92);
+      --paper-strong: rgba(248, 251, 250, 0.98);
+      --paper-soft: rgba(240, 246, 243, 0.88);
+      --ink: #11211c;
+      --ink-soft: #50655d;
+      --ink-faint: #74887f;
+      --line: rgba(17, 33, 28, 0.1);
+      --line-strong: rgba(17, 33, 28, 0.18);
+      --hero-bg: linear-gradient(135deg, #14372d 0%, #1c4c3f 48%, #2a6757 100%);
+      --hero-ink: #f4faf7;
+      --shadow: 0 28px 72px rgba(15, 38, 31, 0.12);
+      --warn: #ab7437;
+      --danger: #b44d3d;
+    }}
+    * {{
+      box-sizing: border-box;
+    }}
+    html, body {{
+      margin: 0;
+      padding: 0;
+      font-family: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at 0 0, rgba(75, 145, 125, 0.12), transparent 28%),
+        radial-gradient(circle at 100% 12%, rgba(75, 145, 125, 0.08), transparent 24%),
+        var(--bg);
+      color: var(--ink);
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }}
+    body {{
+      min-height: 100vh;
+      position: relative;
+    }}
+    body::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.28;
+      background:
+        linear-gradient(90deg, rgba(255,255,255,0.14) 0, rgba(255,255,255,0.14) 1px, transparent 1px, transparent 100%),
+        linear-gradient(rgba(255,255,255,0.14) 0, rgba(255,255,255,0.14) 1px, transparent 1px, transparent 100%);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.48), transparent 72%);
+    }}
+    @keyframes rise-in {{
+      from {{
+        opacity: 0;
+        transform: translateY(18px);
+      }}
+      to {{
+        opacity: 1;
+        transform: translateY(0);
+      }}
+    }}
+    .report-shell {{
+      width: min(100%, 1480px);
+      margin: 0 auto;
+      padding: 24px 14px 48px;
+    }}
+    .report-frame {{
+      position: relative;
+      overflow: hidden;
+      border-radius: 34px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(248, 251, 250, 0.98), rgba(244, 248, 246, 0.98));
+      box-shadow: var(--shadow);
+    }}
+    .report-frame::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 0 0, rgba(255,255,255,0.72), transparent 34%),
+        radial-gradient(circle at 100% 24%, rgba(75, 145, 125, 0.08), transparent 24%),
+        linear-gradient(180deg, transparent 0%, rgba(255,255,255,0.22) 100%);
+    }}
+    .top-ribbon {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px 18px;
+      padding: 18px 24px 0;
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }}
+    .hero {{
+      position: relative;
+      z-index: 1;
+      padding: 18px 24px 10px;
+    }}
+    .hero-grid {{
+      display: grid;
+      gap: 18px;
+    }}
+    .hero-intro {{
+      position: relative;
+      overflow: hidden;
+      padding: 30px 24px;
+      border-radius: 30px;
+      background: var(--hero-bg);
+      color: var(--hero-ink);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      animation: rise-in 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }}
+    .hero-intro::before {{
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -160px;
+      top: -220px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255,255,255,0.16), transparent 68%);
+    }}
+    .hero-intro::after {{
+      content: "INSPECTION";
+      position: absolute;
+      right: 26px;
+      bottom: 16px;
+      color: rgba(255,255,255,0.08);
+      font-size: clamp(34px, 7vw, 104px);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      line-height: 1;
+    }}
+    .eyebrow {{
+      margin: 0;
+      color: var(--accent-bright);
+      font-size: 12px;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+    }}
+    .hero h1 {{
+      position: relative;
+      z-index: 1;
+      margin: 18px 0 18px;
+      max-width: 920px;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(42px, 7vw, 80px);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }}
+    .hero-summary {{
+      position: relative;
+      z-index: 1;
+      margin: 0;
+      max-width: 760px;
+      color: rgba(244, 250, 247, 0.88);
+      font-size: 16px;
+      line-height: 1.86;
+    }}
+    .hero-lead {{
+      position: relative;
+      z-index: 1;
+      max-width: 820px;
+      margin: 18px 0 0;
+      color: rgba(244, 250, 247, 0.78);
+      font-size: 13px;
+      line-height: 1.85;
+    }}
+    .hero-foot,
+    .runtime-list,
+    .signal-list {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }}
+    .anchor-nav {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }}
+    .anchor-link {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
+      font-size: 12px;
+      line-height: 1.5;
+      text-decoration: none;
+      backdrop-filter: blur(12px);
+    }}
+    .anchor-link:hover {{
+      background: rgba(255,255,255,0.14);
+    }}
+    .hero-chip,
+    .runtime-pill,
+    .signal-pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.5);
+      color: inherit;
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .hero-chip {{
+      border-color: rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
+      backdrop-filter: blur(12px);
+    }}
+    .hero-side {{
+      display: grid;
+      gap: 16px;
+    }}
+    .hero-side > * {{
+      animation: rise-in 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+      animation-delay: 120ms;
+    }}
+    .risk-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      backdrop-filter: blur(12px);
+    }}
+    .risk-dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+      box-shadow: 0 0 16px currentColor;
+    }}
+    .risk-high {{
+      color: var(--danger);
+      background: rgba(180, 77, 61, 0.16);
+    }}
+    .risk-medium {{
+      color: var(--warn);
+      background: rgba(171, 116, 55, 0.16);
+    }}
+    .risk-low {{
+      color: #d7f2e8;
+    }}
+    .meta-card,
+    .panel {{
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--paper);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.48);
+      backdrop-filter: blur(10px);
+      transition: transform 220ms ease, box-shadow 220ms ease, border-color 220ms ease;
+    }}
+    .meta-card:hover,
+    .panel:hover {{
+      transform: translateY(-3px);
+      border-color: var(--line-strong);
+      box-shadow: 0 18px 40px rgba(15, 38, 31, 0.08), inset 0 1px 0 rgba(255,255,255,0.45);
+    }}
+    .meta-card::before,
+    .panel::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(255,255,255,0.34), rgba(255,255,255,0));
+    }}
+    .meta-card {{
+      padding: 18px 18px 20px;
+    }}
+    .meta-card.featured,
+    .panel-strong {{
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(244, 249, 246, 0.95));
+    }}
+    .meta-card.dark,
+    .panel-dark,
+    .command-card {{
+      border-color: rgba(11, 26, 22, 0.18);
+      background: linear-gradient(135deg, #14241f 0%, #10201b 100%);
+      color: #eff7f3;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }}
+    .meta-card.dark::before,
+    .panel-dark::before,
+    .command-card::before {{
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent 40%);
+    }}
+    .meta-label,
+    .panel-kicker {{
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }}
+    .meta-card.dark .meta-label,
+    .panel-dark .panel-kicker {{
+      color: #bfded4;
+    }}
+    .meta-value {{
+      position: relative;
+      z-index: 1;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: 28px;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      color: inherit;
+    }}
+    .meta-note {{
+      position: relative;
+      z-index: 1;
+      margin-top: 12px;
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.75;
+    }}
+    .meta-card.dark .meta-note,
+    .panel-dark .panel-summary,
+    .panel-dark p {{
+      color: rgba(239, 247, 243, 0.74);
+    }}
+    .meta-board {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .meta-tile span {{
+      display: block;
+    }}
+    .meta-name {{
+      margin-bottom: 6px;
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }}
+    .meta-card.dark .meta-name {{
+      color: rgba(239, 247, 243, 0.54);
+    }}
+    .meta-copy {{
+      font-size: 14px;
+      line-height: 1.55;
+      color: inherit;
+    }}
+    .section-flow {{
+      position: relative;
+      z-index: 1;
+      padding: 8px 24px 28px;
+    }}
+    .summary-board {{
+      display: grid;
+      gap: 14px;
+      margin: 18px 0 0;
+    }}
+    .summary-card {{
+      padding: 16px 16px 18px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: var(--paper-soft);
+    }}
+    .summary-label {{
+      margin-bottom: 8px;
+      color: var(--accent);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }}
+    .summary-copy {{
+      font-size: 14px;
+      line-height: 1.8;
+      color: var(--ink);
+    }}
+    .section-heading {{
+      display: grid;
+      gap: 8px;
+      padding: 8px 4px 16px;
+    }}
+    .section-index {{
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+    }}
+    .section-title {{
+      margin: 0;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(28px, 4vw, 42px);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+    }}
+    .section-caption {{
+      margin: 0;
+      max-width: 820px;
+      color: var(--ink-soft);
+      font-size: 14px;
+      line-height: 1.8;
+    }}
+    .panel-grid {{
+      display: grid;
+      gap: 18px;
+    }}
+    .panel-grid > * {{
+      animation: rise-in 720ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }}
+    .panel-grid > *:nth-child(2) {{ animation-delay: 70ms; }}
+    .panel-grid > *:nth-child(3) {{ animation-delay: 120ms; }}
+    .panel-grid > *:nth-child(4) {{ animation-delay: 170ms; }}
+    .panel-grid > *:nth-child(5) {{ animation-delay: 220ms; }}
+    .panel-grid > *:nth-child(6) {{ animation-delay: 270ms; }}
+    .panel-body {{
+      position: relative;
+      z-index: 1;
+      padding: 20px 20px 22px;
+    }}
+    .panel h2 {{
+      margin: 0;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(26px, 3vw, 34px);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      color: inherit;
+    }}
+    .panel-summary {{
+      margin: 10px 0 0;
+      max-width: 64ch;
+      color: var(--ink-soft);
+      font-size: 14px;
+      line-height: 1.8;
+    }}
+    .metrics {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }}
+    .metric-card {{
+      position: relative;
+      overflow: hidden;
+      padding: 18px 16px 20px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: rgba(17, 33, 28, 0.035);
+    }}
+    .metric-card::after {{
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 4px;
+      background: linear-gradient(90deg, var(--accent), rgba(17, 33, 28, 0));
+    }}
+    .metric-label {{
+      font-size: 11px;
+      color: var(--ink-faint);
+      margin-bottom: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }}
+    .metric-value {{
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(28px, 5vw, 40px);
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: -0.04em;
+    }}
+    .table-shell {{
+      width: 100%;
+      overflow-x: auto;
+      margin-top: 18px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.6);
+    }}
+    table {{
+      width: 100%;
+      min-width: 680px;
+      border-collapse: collapse;
+      table-layout: fixed;
+      background: transparent;
+    }}
+    th, td {{
+      border: 1px solid var(--line);
+      padding: 12px 13px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+      word-break: break-word;
+    }}
+    th {{
+      background: #162722;
+      color: #eef7f3;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 11px;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    tbody tr:nth-child(even) td {{
+      background: rgba(17, 33, 28, 0.025);
+    }}
+    tbody tr:hover td {{
+      background: rgba(75, 145, 125, 0.08);
+    }}
+    td.empty {{
+      text-align: center;
+      color: var(--ink-soft);
+      padding: 22px;
+    }}
+    ul {{
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      line-height: 1.8;
+    }}
+    li {{
+      position: relative;
+      padding-left: 18px;
+      color: inherit;
+    }}
+    li + li {{
+      margin-top: 10px;
+    }}
+    li::before {{
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0.78em;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      transform: translateY(-50%);
+      box-shadow: 0 0 0 4px rgba(75, 145, 125, 0.12);
+    }}
+    .notice-block {{
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(171, 116, 55, 0.22);
+      background: rgba(171, 116, 55, 0.09);
+      color: #6a4a27;
+      font-size: 13px;
+      line-height: 1.78;
+    }}
+    .notice-block p {{
+      margin: 0 0 6px;
+      color: inherit;
+    }}
+    .notice-block p:last-child {{
+      margin-bottom: 0;
+    }}
+    .panel-dark .runtime-pill,
+    .panel-dark .signal-pill,
+    .meta-card.dark .runtime-pill,
+    .meta-card.dark .signal-pill {{
+      border-color: rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.08);
+      color: #eff7f3;
+    }}
+    .command-grid {{
+      display: grid;
+      gap: 14px;
+      margin-top: 18px;
+    }}
+    .command-card {{
+      position: relative;
+      border-radius: 20px;
+      padding: 16px;
+    }}
+    .command-target {{
+      font-size: 11px;
+      color: rgba(239, 247, 243, 0.62);
+      margin-bottom: 8px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }}
+    .command-line {{
+      font-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
+      font-size: 13px;
+      color: #cde9df;
+      margin-bottom: 10px;
+      font-weight: 600;
+    }}
+    pre {{
+      margin: 0;
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.05);
+      color: #edf5ef;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
+      font-size: 11px;
+      line-height: 1.55;
+    }}
+    .empty-panel {{
+      padding: 16px;
+      border: 1px dashed var(--line);
+      border-radius: 16px;
+      color: var(--ink-soft);
+      background: rgba(255,255,255,0.36);
+    }}
+    .legacy-grid {{
+      display: grid;
+      gap: 16px;
+      margin-top: 18px;
+    }}
+    .subpanel {{
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: rgba(255,255,255,0.52);
+    }}
+    .subpanel h3 {{
+      margin: 0;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: 22px;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+    }}
+    .subpanel-summary {{
+      margin: 8px 0 0;
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.75;
+    }}
+    .subpanel.full {{
+      grid-column: 1 / -1;
+    }}
+    .node-header {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 14px;
+    }}
+    .bar-row,
+    .line-row {{
+      display: grid;
+      grid-template-columns: minmax(120px, 220px) 1fr 70px;
+      align-items: center;
+      gap: 12px;
+      margin: 12px 0;
+    }}
+    .bar-track,
+    .line-track {{
+      background: rgba(17, 33, 28, 0.08);
+      height: 12px;
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .bar-track span,
+    .line-track span {{
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #8fc4b1);
+      border-radius: 999px;
+    }}
+    .bar-label,
+    .line-label,
+    .bar-value,
+    .line-value {{
+      font-size: 14px;
+    }}
+    .footer-bar {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 24px 24px;
+      color: var(--ink-faint);
+      font-size: 12px;
+      line-height: 1.7;
+    }}
+    .footer-bar strong {{
+      color: var(--ink);
+      font-weight: 600;
+    }}
+    @media (min-width: 760px) {{
+      .report-shell {{ padding: 30px 20px 56px; }}
+      .top-ribbon {{ padding: 22px 30px 0; }}
+      .hero {{ padding: 22px 30px 12px; }}
+      .section-flow {{ padding: 10px 30px 30px; }}
+      .command-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .summary-board {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+    }}
+    @media (min-width: 980px) {{
+      .hero-grid {{
+        grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.72fr);
+        align-items: start;
+      }}
+      .section-heading {{
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: end;
+        gap: 20px;
+      }}
+      .metrics {{
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }}
+      .panel-grid {{
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+      }}
+      .legacy-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .span-4 {{ grid-column: span 4; }}
+      .span-5 {{ grid-column: span 5; }}
+      .span-6 {{ grid-column: span 6; }}
+      .span-7 {{ grid-column: span 7; }}
+      .span-8 {{ grid-column: span 8; }}
+      .span-12 {{ grid-column: span 12; }}
+    }}
+    @media print {{
+      body {{
+        background: #fff;
+      }}
+      body::before {{
+        display: none;
+      }}
+      .report-shell {{
+        margin: 0;
+        padding: 0;
+        width: 100%;
+      }}
+      .report-frame {{
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+      }}
+      .hero-intro,
+      .panel-dark,
+      .meta-card.dark,
+      .command-card,
+      th,
+      pre {{
+        color: #111 !important;
+        background: #fff !important;
+      }}
+      th {{
+        position: static !important;
+      }}
+      .panel,
+      .meta-card,
+      .metric-card,
+      .table-shell,
+      .command-card,
+      .subpanel {{
+        break-inside: avoid;
+      }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      .hero-intro,
+      .hero-side > *,
+      .panel-grid > *,
+      .meta-card,
+      .panel {{
+        animation: none !important;
+        transition: none !important;
+        transform: none !important;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="report-shell">
+    <div class="report-frame">
+      <div class="top-ribbon">
+        <div>JumpServer / Full Inspection Dossier</div>
+        <div>{escape(metadata['company'])} / Generated {escape(metadata['generated_at'])}</div>
+      </div>
 
-    return f"""
-    <html lang="zh-CN">
-    <head>
-      <meta charset="utf-8" />
-      <title>{escape(metadata['title'])}</title>
-      <style>
-        body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7f8; color: #14211d; }}
-        .page {{ width: 1120px; margin: 24px auto; background: #fff; border-radius: 18px; padding: 32px 36px; box-shadow: 0 18px 48px rgba(0,0,0,.08); }}
-        .cover {{ background: linear-gradient(135deg, #1b4d3e, #4b917d); color: #fff; min-height: 420px; }}
-        h1, h2, h3 {{ margin: 0 0 14px; }}
-        h2 {{ font-size: 24px; }}
-        h3 {{ font-size: 18px; margin-top: 22px; }}
-        p {{ line-height: 1.7; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 14px 0 24px; font-size: 14px; }}
-        th, td {{ border: 1px solid #d8e2de; padding: 10px 12px; text-align: left; vertical-align: top; }}
-        th {{ background: #edf4f1; }}
-        .empty, .empty-panel {{ color: #5f746c; padding: 14px; background: #f6faf8; border-radius: 10px; }}
-        .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 18px 0 24px; }}
-        .metric-card {{ border: 1px solid #d6e1dd; border-radius: 12px; padding: 14px; background: #f7fbf9; }}
-        .metric-label {{ font-size: 13px; color: #4b5f58; margin-bottom: 8px; }}
-        .metric-value {{ font-size: 28px; font-weight: 700; }}
-        .legacy-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
-        .legacy-card {{ padding: 22px; border: 1px solid #e0e8e4; border-radius: 16px; margin-bottom: 24px; }}
-        .bar-row, .line-row {{ display: grid; grid-template-columns: 220px 1fr 70px; align-items: center; gap: 12px; margin: 10px 0; }}
-        .bar-track, .line-track {{ background: #ebf2ef; height: 12px; border-radius: 999px; overflow: hidden; }}
-        .bar-track span, .line-track span {{ display: block; height: 100%; background: linear-gradient(90deg, #4b917d, #8ec5af); border-radius: 999px; }}
-        .bar-label, .line-label, .bar-value, .line-value {{ font-size: 14px; }}
-        .notice {{ margin: 14px 0 22px; padding: 14px 16px; border-radius: 10px; }}
-        .notice.error {{ background: #fff2f2; color: #a33131; border: 1px solid #f3c7c7; }}
-      </style>
-    </head>
-    <body>
-      <section class="page cover">
-        <div>JumpServer Legacy Inspection</div>
-        <h1>{escape(metadata['title'])}</h1>
-        <p>旧版巡检报告字段级对齐输出。系统信息从 JumpServer 节点本机采集，数据库指标优先通过服务器本地配置文件解析后查询。本次汇总区间为 <strong>{escape(context['date_from'])}</strong> 至 <strong>{escape(context['date_to'])}</strong>。</p>
-        <div class="metrics">
-          {render_metric_cards([
-            ("环境", metadata["profile_name"]),
-            ("组织范围", context["scope_name"]),
-            ("版本", report_version),
-            ("查询区间", f"{context['date_from']} 至 {context['date_to']}"),
-            ("巡检时间", metadata["generated_at"]),
-          ])}
+      <header class="hero">
+        <div class="hero-grid">
+          <section class="hero-intro">
+            <p class="eyebrow">JumpServer Inspection Report</p>
+            {render_risk_badge(risk_level)}
+            <h1>{escape(metadata['title'])}</h1>
+            <p class="hero-summary">{escape(dispatch_message)}</p>
+            <p class="hero-lead">{coverage_summary}</p>
+            <div class="hero-foot">
+              <span class="hero-chip">Profile / {escape(metadata['profile_name'])}</span>
+              <span class="hero-chip">Scope / {escape(context['scope_name'])}</span>
+              <span class="hero-chip">Version / {escape(report_version)}</span>
+              <span class="hero-chip">Window / {escape(context['date_from'])} - {escape(context['date_to'])}</span>
+            </div>
+            {render_anchor_nav(section_nav)}
+          </section>
+          <aside class="hero-side">
+            <section class="meta-card featured">
+              <span class="meta-label">Executive Snapshot</span>
+              <div class="meta-value">正式巡检总览</div>
+              <p class="meta-note">面向值班、运维和安全汇报的完整版巡检摘要，保留完整节点与数据库数据面。</p>
+              {render_html_list(bundle['executive_summary_items'])}
+            </section>
+            <section class="meta-card dark">
+              <span class="meta-label">Report Identity</span>
+              <div class="meta-board">
+                <div class="meta-tile">
+                  <span class="meta-name">统计区间</span>
+                  <span class="meta-copy">{escape(context['date_from'])} 至 {escape(context['date_to'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">生成时间</span>
+                  <span class="meta-copy">{escape(metadata['generated_at'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">客户</span>
+                  <span class="meta-copy">{escape(metadata['customer'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">JumpServer</span>
+                  <span class="meta-copy">{escape(metadata['base_url'])}</span>
+                </div>
+              </div>
+              <div class="runtime-list">
+                <span class="runtime-pill">Company：{escape(metadata['company'])}</span>
+                <span class="runtime-pill">Theme：{escape(metadata['theme_color'])}</span>
+              </div>
+            </section>
+          </aside>
+        </div>
+        {render_notice_block(notice_items)}
+      </header>
+
+      <section class="section-flow" id="overview">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">01 / Executive Overview</div>
+            <h2 class="section-title">总览与态势</h2>
+          </div>
+          <p class="section-caption">先给出风险等级、关键异常、覆盖节点和重点结论，便于值班同学快速完成晨会或交班使用。</p>
+        </div>
+        {render_summary_callouts(summary_callouts)}
+        <div class="panel-grid">
+          <article class="panel panel-strong span-12">
+            <div class="panel-body">
+              <p class="panel-kicker">Security Posture</p>
+              <h2>核心态势指标</h2>
+              <p class="panel-summary">综合平台风险、纳管规模、会话、登录和高危命令数据，形成正式巡检的摘要层。</p>
+              <div class="metrics">{render_metric_cards(overview_cards)}</div>
+            </div>
+          </article>
+
+          <article class="panel span-7">
+            <div class="panel-body">
+              <p class="panel-kicker">Target Coverage</p>
+              <h2>巡检目标</h2>
+              <p class="panel-summary">本次巡检以 JumpServer 节点为采集中心，覆盖 {len(context["overview_targets"])} 个节点，主要资产类型为 {escape(asset_type_text)}。</p>
+              {render_html_table_block([("机器名", "asset_name"), ("机器类型", "platform"), ("机器 IP", "ip"), ("机器端口", "port"), ("SSH 用户名", "username"), ("是否有效", "enabled"), ("状态", "status")], context["overview_targets"], "未配置 JMS_SYSTEM_TARGETS。")}
+            </div>
+          </article>
+
+          <article class="panel span-5">
+            <div class="panel-body">
+              <p class="panel-kicker">Findings</p>
+              <h2>关键发现</h2>
+              <p class="panel-summary">适合在日报正文或管理摘要中直接引用的重点结论。</p>
+              {render_html_list(bundle['key_findings_items'])}
+            </div>
+          </article>
+
+          <article class="panel span-8">
+            <div class="panel-body">
+              <p class="panel-kicker">Anomaly Focus</p>
+              <h2>异常聚焦</h2>
+              <p class="panel-summary">合并登录失败、异常资产、会话风险和命令巡检异常，作为优先排查清单。</p>
+              {render_html_table_block([("异常等级", "level"), ("异常节点", "node"), ("异常描述", "description")], context["anomaly_rows"], "当前未发现需要升级处理的异常。")}
+            </div>
+          </article>
+
+          <article class="panel panel-dark span-4">
+            <div class="panel-body">
+              <p class="panel-kicker">Risk Surface</p>
+              <h2>风险摘要</h2>
+              <p class="panel-summary">将安全风险项压缩到右侧，便于在手机端快速浏览。</p>
+              {render_html_list(bundle['security_risk_items'], "今日未识别出显著安全风险。")}
+            </div>
+          </article>
         </div>
       </section>
-      <section class="page">
-        <h2>1. 综述</h2>
-        <h3>1.1 巡检目标</h3>
-        <p>本次巡检以 JumpServer 服务器为采集中心，覆盖 {len(context["overview_targets"])} 个节点，节点角色包括 {escape("、".join(sorted({str(item.get("role") or "-") for item in snapshots}) or ["jumpserver"]))}。</p>
-        {render_html_table([("机器名", "asset_name"), ("机器类型", "platform"), ("机器 IP", "ip"), ("机器端口", "port"), ("SSH 用户名", "username"), ("是否有效", "enabled"), ("状态", "status")], context["overview_targets"], "未配置 JMS_SYSTEM_TARGETS。")}
-        <h3>1.2 运行概况</h3>
-        {render_html_table([("异常等级", "level"), ("异常节点", "node"), ("异常描述", "description")], context["anomaly_rows"], "当前未发现需要升级处理的异常。")}
-        <h3>1.3 运营概况</h3>
-        <p>当前组织数 <strong>{operations["org_count"]}</strong>，用户数 <strong>{operations["user_count"]}</strong>，资产数 <strong>{operations["asset_count"]}</strong>，资产类型前三为 <strong>{escape(asset_type_text)}</strong>，在线会话数 <strong>{operations["online_sessions"]}</strong>，最大单日登录次数 <strong>{operations["max_daily_login_count"]}</strong>，最大单日访问资产数 <strong>{operations["max_daily_asset_access_count"]}</strong>。</p>
-        {system_notice}
-        {db_notice}
-      </section>
-      <section class="page">
-        <h2>2. 数据库与系统巡检</h2>
-        <h3>2.1 RDS 状态</h3>
-        {render_html_table([("主机", "hostname"), ("版本", "version"), ("版本说明", "version_comment"), ("端口", "port"), ("检查时间", "checked_at")], db_metrics["rds_status_rows"], "未采集到数据库实例状态。")}
-        <h3>2.2 数据库表大小前 10 位</h3>
-        {render_html_table([("表名", "table_name"), ("大小(MB)", "size_mb"), ("记录数", "table_rows")], db_metrics["table_size_rows"], "未采集到表大小数据。")}
-      </section>
-      <section class="page">
-        {''.join(system_blocks) if system_blocks else '<div class="empty-panel">未采集到节点级系统巡检结果。</div>'}
-      </section>
-      <section class="page">
-        <h2>3. 运营巡检</h2>
-        <div class="metrics">
-          {render_metric_cards([
-            ("组织数", operations["org_count"]),
-            ("用户数", operations["user_count"]),
-            ("资产数", operations["asset_count"]),
-            ("在线会话数", operations["online_sessions"]),
-          ])}
+
+      <section class="section-flow" id="ops">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">02 / Database And Operations</div>
+            <h2 class="section-title">数据库与运营指标</h2>
+          </div>
+          <p class="section-caption">这一层保留正式巡检需要的数据库状态、表大小、协议分布、登录趋势与运营统计，兼顾归档和排障。</p>
         </div>
-        {render_html_table([("指标", "metric"), ("值", "value")], operation_rows, "未采集到运营巡检指标。")}
-        <h3>3.1 协议占比</h3>
-        {render_bar_list(db_metrics["protocol_distribution"], empty_text="未采集到协议占比。")}
-        <h3>3.2 {escape(trend_label)}用户登录数</h3>
-        {render_line_series(db_metrics["weekly_user_trend"], empty_text="未采集到周用户趋势。")}
-        <h3>3.3 {escape(trend_label)}资产登录数</h3>
-        {render_line_series(db_metrics["weekly_asset_trend"], empty_text="未采集到周资产趋势。")}
-        <h3>3.4 近三个月活跃用户 Top 5</h3>
-        {render_bar_list(db_metrics["active_users_top5"], empty_text="未采集到活跃用户排行。")}
-        <h3>3.5 近三个月活跃资产 Top 5</h3>
-        {render_bar_list(db_metrics["active_assets_top5"], empty_text="未采集到活跃资产排行。")}
-      </section>
-      <section class="page">
-        <h2>4. 操作审计与处置建议</h2>
-        <div class="metrics">
-          {render_metric_cards([
-            ("审计记录", context["operate_stats"]["total"]),
-            ("高风险操作", len(context["operate_stats"]["dangerous_rows"])),
-            ("审计用户数", len(context["operate_stats"]["user_counter"])),
-            ("动作类型数", len(context["operate_stats"]["action_counter"])),
-          ])}
+        <div class="panel-grid">
+          <article class="panel span-6">
+            <div class="panel-body">
+              <p class="panel-kicker">Database</p>
+              <h2>RDS 状态</h2>
+              <p class="panel-summary">确认数据库版本、端口和检测时间，便于快速识别后端实例异常。</p>
+              {render_html_table_block([("主机", "hostname"), ("版本", "version"), ("版本说明", "version_comment"), ("端口", "port"), ("检查时间", "checked_at")], db_metrics["rds_status_rows"], "未采集到数据库实例状态。")}
+            </div>
+          </article>
+
+          <article class="panel span-6">
+            <div class="panel-body">
+              <p class="panel-kicker">Capacity</p>
+              <h2>数据库表大小前 10</h2>
+              <p class="panel-summary">帮助判断审计、会话或操作记录相关表是否出现异常膨胀。</p>
+              {render_html_table_block([("表名", "table_name"), ("大小(MB)", "size_mb"), ("记录数", "table_rows")], db_metrics["table_size_rows"], "未采集到表大小数据。")}
+            </div>
+          </article>
+
+          <article class="panel span-12">
+            <div class="panel-body">
+              <p class="panel-kicker">Operations Summary</p>
+              <h2>运营概况</h2>
+              <p class="panel-summary">当前组织数 <strong>{operations["org_count"]}</strong>，用户数 <strong>{operations["user_count"]}</strong>，资产数 <strong>{operations["asset_count"]}</strong>，资产类型前三为 <strong>{escape(asset_type_text)}</strong>，在线会话数 <strong>{operations["online_sessions"]}</strong>，最大单日访问资产数 <strong>{operations["max_daily_asset_access_count"]}</strong>。</p>
+              {render_html_table_block([("指标", "metric"), ("值", "value")], operation_rows, "未采集到运营巡检指标。")}
+            </div>
+          </article>
+
+          <article class="panel span-4">
+            <div class="panel-body">
+              <p class="panel-kicker">Protocol</p>
+              <h2>协议占比</h2>
+              <p class="panel-summary">按协议查看近阶段访问占比，辅助识别连接习惯变化。</p>
+              {render_bar_list(db_metrics["protocol_distribution"], empty_text="未采集到协议占比。")}
+            </div>
+          </article>
+
+          <article class="panel span-4">
+            <div class="panel-body">
+              <p class="panel-kicker">Trend</p>
+              <h2>{escape(trend_label)}用户登录数</h2>
+              <p class="panel-summary">用于观察用户登录趋势变化。</p>
+              {render_line_series(db_metrics["weekly_user_trend"], empty_text="未采集到周用户趋势。")}
+            </div>
+          </article>
+
+          <article class="panel span-4">
+            <div class="panel-body">
+              <p class="panel-kicker">Trend</p>
+              <h2>{escape(trend_label)}资产登录数</h2>
+              <p class="panel-summary">用于观察资产访问热度和波动。</p>
+              {render_line_series(db_metrics["weekly_asset_trend"], empty_text="未采集到周资产趋势。")}
+            </div>
+          </article>
+
+          <article class="panel span-6">
+            <div class="panel-body">
+              <p class="panel-kicker">Top Users</p>
+              <h2>近三个月活跃用户 Top 5</h2>
+              <p class="panel-summary">作为常驻账号和热点访问主体的参考。</p>
+              {render_bar_list(db_metrics["active_users_top5"], empty_text="未采集到活跃用户排行。")}
+            </div>
+          </article>
+
+          <article class="panel span-6">
+            <div class="panel-body">
+              <p class="panel-kicker">Top Assets</p>
+              <h2>近三个月活跃资产 Top 5</h2>
+              <p class="panel-summary">识别热点资产和需要重点盯防的连接目标。</p>
+              {render_bar_list(db_metrics["active_assets_top5"], empty_text="未采集到活跃资产排行。")}
+            </div>
+          </article>
         </div>
-        {render_notice_block([
-          f"操作审计采集说明：{context['operate_error']}" if context.get('operate_error') else "",
-        ])}
-        <h3>4.1 高风险操作</h3>
-        {render_html_table([("时间", "time"), ("用户", "username"), ("动作", "action"), ("对象", "target")], context["operate_stats"]["dangerous_rows"][:20], "未发现高风险操作审计记录。")}
-        <h3>4.2 最近操作审计</h3>
-        {render_html_table([("时间", "time"), ("用户", "username"), ("动作", "action"), ("对象", "target")], context["operate_stats"]["rows"][:20], "未获取到操作审计记录。")}
       </section>
-    </body>
-    </html>
-    """
+
+      <section class="section-flow" id="nodes">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">03 / Node Inspection</div>
+            <h2 class="section-title">节点巡检明细</h2>
+          </div>
+          <p class="section-caption">保留正式巡检报告要求的节点级系统信息和命令证据，适合归档、审计和后续复盘。</p>
+        </div>
+        <div class="panel-grid">
+          {''.join(system_blocks) if system_blocks else '<article class="panel span-12"><div class="panel-body"><p class="panel-kicker">Node Inspection</p><h2>节点巡检结果</h2><p class="panel-summary">当前未采集到节点级系统巡检结果。</p><div class="empty-panel">未采集到节点级系统巡检结果。</div></div></article>'}
+        </div>
+      </section>
+
+      <section class="section-flow" id="audit">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">04 / Audit And Follow Up</div>
+            <h2 class="section-title">审计与处置建议</h2>
+          </div>
+          <p class="section-caption">最后给出高风险操作、最近审计、风险摘要和后续动作，构成一份可以直接交付的巡检报告尾段。</p>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-7">
+            <div class="panel-body">
+              <p class="panel-kicker">Audit</p>
+              <h2>高风险操作审计</h2>
+              <p class="panel-summary">提取 delete、remove、drop 等高风险动作，适合作为正式巡检里的重点审计项。</p>
+              {render_html_table_block([("时间", "time"), ("用户", "username"), ("动作", "action"), ("对象", "target")], bundle["operate_stats"]["dangerous_rows"][:20], "未发现高风险操作审计记录。")}
+            </div>
+          </article>
+
+          <article class="panel panel-dark span-5">
+            <div class="panel-body">
+              <p class="panel-kicker">Action</p>
+              <h2>处置建议</h2>
+              <p class="panel-summary">根据当前风险面给出可直接执行的后续动作。</p>
+              {render_html_list(bundle['recommendation_items'])}
+            </div>
+          </article>
+
+          <article class="panel span-7">
+            <div class="panel-body">
+              <p class="panel-kicker">Audit Trail</p>
+              <h2>最近操作审计</h2>
+              <p class="panel-summary">补充展示最近审计记录，便于回溯近期平台操作轨迹。</p>
+              {render_html_table_block([("时间", "time"), ("用户", "username"), ("动作", "action"), ("对象", "target")], bundle["operate_stats"]["rows"][:20], "未获取到操作审计记录。")}
+            </div>
+          </article>
+
+          <article class="panel span-5">
+            <div class="panel-body">
+              <p class="panel-kicker">Runtime</p>
+              <h2>巡检说明</h2>
+              <p class="panel-summary">记录采集来源、运行环境和输出链路，方便后续复跑或交接。</p>
+              {render_html_list(notice_items, "本次巡检数据采集与渲染链路正常。")}
+              <div class="runtime-list">
+                <span class="runtime-pill">Profile：{escape(metadata['profile_name'])}</span>
+                <span class="runtime-pill">组织范围：{escape(context['scope_name'])}</span>
+                <span class="runtime-pill">环境文件：{escape(metadata['profile_source'])}</span>
+                <span class="runtime-pill">报告日期：{escape(metadata['report_date'])}</span>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <div class="footer-bar">
+        <div><strong>{escape(metadata['company'])}</strong> / JumpServer Full Inspection Report</div>
+        <div>{escape(metadata['generated_at'])}</div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
+"""
 
 
 def render_html_report(
@@ -4015,6 +5278,27 @@ def render_html_report(
     session_rows = context["session_stats"]["rows"][:8]
     dangerous_rows = context["operate_stats"]["dangerous_rows"][:10]
     login_failure_rows = context["login_stats"]["failure_details"][:10]
+    dispatch_message = {
+        "高": "风险面已进入优先处置区，建议立即复核异常来源、在线会话与高风险操作。",
+        "中": "当前存在需要跟进的异常项，建议按登录、资产、命令链路逐项收敛。",
+        "低": "巡检结果整体平稳，建议保持日巡检、异常告警和抽样复核联动。",
+    }.get(context["risk_level"], "请结合本次巡检结果继续完成后续复核与处置。")
+    coverage_summary = (
+        f"本次报告覆盖 {escape(metadata['scope_name'])}，统计区间 {escape(context['report_range'])}，"
+        f"已纳管资产 {context['asset_stats']['total']} 台，活跃会话 {context['session_stats']['total']} 条，"
+        f"登录失败 {context['login_stats']['failure']} 次，命令巡检成功节点 "
+        f"{context['command_stats']['success_targets']}/{context['command_stats']['targets']}。"
+    )
+    section_nav = [
+        ("situation", "态势总览"),
+        ("evidence", "主机证据"),
+        ("audit", "访问与审计"),
+    ]
+    summary_callouts = [
+        ("建议先看", dispatch_message),
+        ("首个异常", anomaly_rows[0]["description"] if anomaly_rows else "当前未发现需要升级处理的异常。"),
+        ("建议动作", context["recommendation_items"][0] if context["recommendation_items"] else "当前建议保持日巡检与异常联动。"),
+    ]
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4025,18 +5309,21 @@ def render_html_report(
   <style>
     :root {{
       --accent: {escape(accent)};
-      --accent-bright: #7ef0c7;
-      --accent-soft: rgba(126, 240, 199, 0.16);
-      --bg: #05100e;
-      --bg-elevated: rgba(10, 29, 24, 0.88);
-      --bg-soft: rgba(8, 22, 18, 0.72);
-      --ink: #ebfff8;
-      --muted: #97b7ad;
-      --line: rgba(126, 240, 199, 0.16);
-      --line-strong: rgba(126, 240, 199, 0.34);
-      --warn: #f7c56d;
-      --danger: #ff8d78;
-      --shadow: 0 24px 60px rgba(0, 0, 0, 0.36);
+      --accent-bright: #d9f3eb;
+      --accent-soft: rgba(75, 145, 125, 0.12);
+      --paper: #edf4f1;
+      --paper-strong: #f7fbf9;
+      --paper-soft: rgba(244, 249, 246, 0.78);
+      --ink: #14211d;
+      --ink-soft: #4f645b;
+      --ink-faint: #76887f;
+      --line: rgba(20, 33, 29, 0.1);
+      --line-strong: rgba(20, 33, 29, 0.18);
+      --hero-bg: linear-gradient(135deg, #14372d 0%, #1c4c3f 48%, #2a6757 100%);
+      --hero-ink: #f4faf7;
+      --warn: #ab7437;
+      --danger: #b44d3d;
+      --shadow: 0 30px 80px rgba(15, 38, 31, 0.14);
     }}
     * {{
       box-sizing: border-box;
@@ -4044,33 +5331,46 @@ def render_html_report(
     html, body {{
       margin: 0;
       padding: 0;
-      background: var(--bg);
-      color: var(--ink);
       font-family: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(75, 145, 125, 0.16), transparent 28%),
+        radial-gradient(circle at 100% 18%, rgba(75, 145, 125, 0.08), transparent 24%),
+        linear-gradient(180deg, #e6eeea 0%, #eef5f2 46%, #f5f8f7 100%);
+      color: var(--ink);
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }}
     body {{
       min-height: 100vh;
+      position: relative;
+    }}
+    body::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.42;
       background:
-        radial-gradient(circle at 20% 20%, rgba(53, 132, 108, 0.28), transparent 28%),
-        radial-gradient(circle at 80% 0%, rgba(126, 240, 199, 0.16), transparent 24%),
-        linear-gradient(180deg, #071613 0%, #05100e 46%, #040a09 100%);
+        linear-gradient(90deg, rgba(255,255,255,0.16) 0, rgba(255,255,255,0.16) 1px, transparent 1px, transparent 100%),
+        linear-gradient(rgba(255,255,255,0.16) 0, rgba(255,255,255,0.16) 1px, transparent 1px, transparent 100%);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.42), transparent 75%);
     }}
     a {{
       color: inherit;
     }}
     .report-shell {{
-      width: min(100%, 1280px);
+      width: min(100%, 1460px);
       margin: 0 auto;
-      padding: 20px 14px 40px;
+      padding: 24px 14px 48px;
     }}
     .report-frame {{
       position: relative;
       overflow: hidden;
-      border-radius: 28px;
+      border-radius: 34px;
       border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(9, 24, 20, 0.96) 0%, rgba(6, 16, 14, 0.98) 100%);
+      background:
+        linear-gradient(180deg, rgba(248, 251, 250, 0.96) 0%, rgba(242, 247, 244, 0.98) 100%);
       box-shadow: var(--shadow);
     }}
     .report-frame::before {{
@@ -4079,83 +5379,179 @@ def render_html_report(
       inset: 0;
       pointer-events: none;
       background:
-        linear-gradient(120deg, rgba(126, 240, 199, 0.1), transparent 30%),
-        linear-gradient(180deg, transparent, rgba(126, 240, 199, 0.04));
+        radial-gradient(circle at 0 0, rgba(255,255,255,0.58), transparent 34%),
+        radial-gradient(circle at 100% 24%, rgba(75, 145, 125, 0.08), transparent 22%),
+        linear-gradient(180deg, transparent 0%, rgba(255,255,255,0.22) 100%);
+    }}
+    @keyframes rise-in {{
+      from {{
+        opacity: 0;
+        transform: translateY(18px);
+      }}
+      to {{
+        opacity: 1;
+        transform: translateY(0);
+      }}
+    }}
+    .top-ribbon {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px 18px;
+      padding: 18px 24px 0;
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
     }}
     .hero {{
       position: relative;
-      padding: 26px 18px 22px;
-      border-bottom: 1px solid var(--line);
-      background:
-        radial-gradient(circle at top left, rgba(126, 240, 199, 0.18), transparent 34%),
-        linear-gradient(135deg, rgba(9, 35, 29, 0.96), rgba(6, 19, 16, 0.9));
+      z-index: 1;
+      padding: 18px 24px 10px;
     }}
     .hero-grid {{
       display: grid;
-      gap: 16px;
+      gap: 18px;
+    }}
+    .hero-intro {{
+      position: relative;
+      overflow: hidden;
+      padding: 28px 24px;
+      border-radius: 30px;
+      background: var(--hero-bg);
+      color: var(--hero-ink);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+      animation: rise-in 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }}
+    .hero-intro::before {{
+      content: "";
+      position: absolute;
+      width: 360px;
+      height: 360px;
+      right: -120px;
+      top: -180px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255,255,255,0.14), transparent 68%);
+    }}
+    .hero-intro::after {{
+      content: "DOSSIER";
+      position: absolute;
+      right: 24px;
+      bottom: 12px;
+      color: rgba(255,255,255,0.08);
+      font-size: clamp(40px, 8vw, 110px);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      line-height: 1;
     }}
     .eyebrow {{
       margin: 0;
       color: var(--accent-bright);
       font-size: 12px;
-      letter-spacing: 0.2em;
+      letter-spacing: 0.24em;
       text-transform: uppercase;
     }}
     .hero h1 {{
-      margin: 14px 0 12px;
-      font-size: clamp(28px, 6vw, 54px);
-      line-height: 1.06;
-      letter-spacing: 0.02em;
+      position: relative;
+      z-index: 1;
+      margin: 18px 0 18px;
+      max-width: 860px;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(40px, 7vw, 78px);
+      line-height: 0.94;
+      letter-spacing: -0.04em;
     }}
     .hero-summary {{
       margin: 0;
-      max-width: 760px;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.8;
+      position: relative;
+      z-index: 1;
+      max-width: 720px;
+      color: rgba(247, 241, 230, 0.84);
+      font-size: 16px;
+      line-height: 1.9;
     }}
-    .hero-meta {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+    .hero-lead {{
+      position: relative;
+      z-index: 1;
+      max-width: 760px;
+      margin: 18px 0 0;
+      color: rgba(247, 241, 230, 0.78);
+      font-size: 13px;
+      line-height: 1.85;
+    }}
+    .hero-foot {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }}
+    .anchor-nav {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
       gap: 10px;
       margin-top: 18px;
     }}
-    .meta-card {{
-      padding: 12px 14px;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: rgba(8, 24, 19, 0.62);
+    .anchor-link {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
+      font-size: 12px;
+      line-height: 1.5;
+      text-decoration: none;
       backdrop-filter: blur(12px);
     }}
-    .meta-label {{
-      display: block;
-      margin-bottom: 6px;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+    .anchor-link:hover {{
+      background: rgba(255,255,255,0.14);
     }}
-    .meta-value {{
-      font-size: 14px;
-      font-weight: 600;
+    .hero-chip {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
+      font-size: 12px;
       line-height: 1.5;
+      backdrop-filter: blur(12px);
     }}
     .hero-side {{
+      display: grid;
+      gap: 16px;
+    }}
+    .hero-side > * {{
+      animation: rise-in 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+      animation-delay: 120ms;
+    }}
+    .hero-stack {{
       position: relative;
     }}
     .risk-badge {{
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 8px 14px;
       border-radius: 999px;
-      border: 1px solid var(--line-strong);
-      background: rgba(126, 240, 199, 0.08);
-      color: var(--ink);
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.08);
+      color: var(--hero-ink);
       font-size: 12px;
       font-weight: 600;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
+      backdrop-filter: blur(12px);
     }}
     .risk-dot {{
       width: 8px;
@@ -4166,53 +5562,227 @@ def render_html_report(
     }}
     .risk-high {{
       color: var(--danger);
-      border-color: rgba(255, 141, 120, 0.36);
-      background: rgba(255, 141, 120, 0.1);
+      border-color: rgba(255, 255, 255, 0.12);
+      background: rgba(180, 77, 61, 0.16);
     }}
     .risk-medium {{
       color: var(--warn);
-      border-color: rgba(247, 197, 109, 0.34);
-      background: rgba(247, 197, 109, 0.1);
+      border-color: rgba(255, 255, 255, 0.12);
+      background: rgba(168, 109, 50, 0.16);
     }}
     .risk-low {{
-      color: var(--accent-bright);
+      color: #d7f2e8;
     }}
-    .panel-grid {{
+    .meta-stack,
+    .meta-board {{
       display: grid;
-      gap: 14px;
-      padding: 16px;
+      gap: 12px;
     }}
+    .meta-card,
     .panel {{
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      background: linear-gradient(180deg, rgba(9, 29, 24, 0.92), rgba(6, 18, 15, 0.96));
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+      position: relative;
       overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 248, 239, 0.78);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.45);
+      backdrop-filter: blur(10px);
+      transition: transform 220ms ease, box-shadow 220ms ease, border-color 220ms ease, background-color 220ms ease;
     }}
-    .panel-body {{
-      padding: 18px;
+    .meta-card:hover,
+    .panel:hover {{
+      transform: translateY(-3px);
+      border-color: var(--line-strong);
+      box-shadow: 0 18px 40px rgba(36, 32, 25, 0.1), inset 0 1px 0 rgba(255,255,255,0.42);
     }}
-    .panel-subtle {{
-      background: linear-gradient(180deg, rgba(9, 25, 21, 0.74), rgba(6, 16, 14, 0.9));
+    .meta-card::before,
+    .panel::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(255,255,255,0.34), rgba(255,255,255,0));
     }}
+    .meta-card {{
+      padding: 18px 18px 20px;
+    }}
+    .meta-card.featured {{
+      background: linear-gradient(180deg, rgba(255, 251, 245, 0.96), rgba(244, 236, 221, 0.92));
+    }}
+    .meta-card.dark,
+    .panel-dark {{
+      border-color: rgba(12, 15, 14, 0.2);
+      background: linear-gradient(135deg, #17211d 0%, #101816 100%);
+      color: #eff4ed;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }}
+    .meta-card.dark::before,
+    .panel-dark::before {{
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent 40%);
+    }}
+    .meta-card .meta-label,
     .panel-kicker {{
-      margin: 0 0 6px;
-      color: var(--accent-bright);
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
       font-size: 11px;
       letter-spacing: 0.16em;
       text-transform: uppercase;
+      font-weight: 600;
+    }}
+    .meta-card.dark .meta-label,
+    .panel-dark .panel-kicker {{
+      color: #bfded4;
+    }}
+    .meta-card .meta-value {{
+      position: relative;
+      z-index: 1;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: 28px;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      color: inherit;
+    }}
+    .meta-note {{
+      position: relative;
+      z-index: 1;
+      margin-top: 12px;
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.75;
+    }}
+    .meta-card.dark .meta-note {{
+      color: rgba(239, 244, 237, 0.72);
+    }}
+    .meta-card.dark .meta-name {{
+      color: rgba(239, 244, 237, 0.52);
+    }}
+    .meta-board {{
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+    .meta-tile {{
+      position: relative;
+      z-index: 1;
+      padding-top: 2px;
+    }}
+    .meta-tile span {{
+      display: block;
+    }}
+    .meta-tile .meta-name {{
+      margin-bottom: 6px;
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }}
+    .meta-tile .meta-copy {{
+      font-size: 14px;
+      line-height: 1.55;
+      color: inherit;
+    }}
+    .section-flow {{
+      position: relative;
+      z-index: 1;
+      padding: 8px 24px 28px;
+    }}
+    .summary-board {{
+      display: grid;
+      gap: 14px;
+      margin: 18px 0 0;
+    }}
+    .summary-card {{
+      padding: 16px 16px 18px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: var(--paper-soft);
+    }}
+    .summary-label {{
+      margin-bottom: 8px;
+      color: var(--accent);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }}
+    .summary-copy {{
+      font-size: 14px;
+      line-height: 1.8;
+      color: var(--ink);
+    }}
+    .section-heading {{
+      display: grid;
+      gap: 8px;
+      padding: 8px 4px 16px;
+    }}
+    .section-index {{
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+    }}
+    .section-title {{
+      margin: 0;
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(28px, 4vw, 42px);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+    }}
+    .section-caption {{
+      margin: 0;
+      max-width: 760px;
+      color: var(--ink-soft);
+      font-size: 14px;
+      line-height: 1.8;
+    }}
+    .panel-grid {{
+      display: grid;
+      gap: 18px;
+    }}
+    .panel-grid > * {{
+      animation: rise-in 720ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }}
+    .panel-grid > *:nth-child(2) {{
+      animation-delay: 70ms;
+    }}
+    .panel-grid > *:nth-child(3) {{
+      animation-delay: 120ms;
+    }}
+    .panel-grid > *:nth-child(4) {{
+      animation-delay: 170ms;
+    }}
+    .panel-grid > *:nth-child(5) {{
+      animation-delay: 220ms;
+    }}
+    .panel-grid > *:nth-child(6) {{
+      animation-delay: 270ms;
+    }}
+    .panel-body {{
+      position: relative;
+      z-index: 1;
+      padding: 20px 20px 22px;
+    }}
+    .panel-strong {{
+      background: linear-gradient(180deg, rgba(255, 252, 247, 0.98), rgba(245, 238, 226, 0.94));
     }}
     .panel h2 {{
       margin: 0;
-      font-size: 20px;
-      line-height: 1.25;
-      color: var(--ink);
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(26px, 3vw, 34px);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      color: inherit;
     }}
     .panel-summary {{
       margin: 10px 0 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.75;
+      max-width: 62ch;
+      color: var(--ink-soft);
+      font-size: 14px;
+      line-height: 1.8;
+    }}
+    .panel-dark .panel-summary,
+    .panel-dark p,
+    .meta-card.dark p {{
+      color: rgba(239, 244, 237, 0.72);
     }}
     section {{
       margin: 0;
@@ -4220,92 +5790,141 @@ def render_html_report(
     p {{
       margin: 0;
       line-height: 1.8;
-      color: var(--muted);
+      color: var(--ink-soft);
     }}
     .metrics {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
+      gap: 12px;
+      margin-top: 18px;
     }}
     .metric-card {{
-      padding: 14px 14px 16px;
-      border-radius: 18px;
+      position: relative;
+      overflow: hidden;
+      padding: 18px 16px 20px;
+      border-radius: 20px;
       border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(126, 240, 199, 0.08), rgba(8, 24, 19, 0.84));
+      background: rgba(23, 22, 18, 0.035);
+    }}
+    .metric-card::after {{
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 4px;
+      background: linear-gradient(90deg, var(--accent), rgba(23, 22, 18, 0));
     }}
     .metric-label {{
       font-size: 11px;
-      color: var(--muted);
-      margin-bottom: 10px;
-      letter-spacing: 0.08em;
+      color: var(--ink-faint);
+      margin-bottom: 12px;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
     }}
     .metric-value {{
-      font-size: clamp(22px, 5vw, 34px);
+      font-family: "Iowan Old Style", "Georgia", "Songti SC", serif;
+      font-size: clamp(28px, 5vw, 40px);
       font-weight: 700;
       color: var(--ink);
+      letter-spacing: -0.04em;
     }}
     .table-shell {{
       width: 100%;
       overflow-x: auto;
-      border-radius: 16px;
+      margin-top: 18px;
+      border-radius: 18px;
       border: 1px solid var(--line);
-      background: rgba(6, 17, 14, 0.7);
+      background: rgba(255, 255, 255, 0.56);
     }}
     table {{
       width: 100%;
-      min-width: 620px;
+      min-width: 680px;
       border-collapse: collapse;
       table-layout: fixed;
       background: transparent;
     }}
     th, td {{
       border: 1px solid var(--line);
-      padding: 10px 12px;
+      padding: 12px 13px;
       text-align: left;
       vertical-align: top;
-      font-size: 12px;
+      font-size: 13px;
       word-break: break-word;
     }}
     th {{
-      background: rgba(126, 240, 199, 0.14);
-      color: var(--accent-bright);
+      background: #171b19;
+      color: #eef4ed;
       font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 11px;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    tbody tr:nth-child(even) td {{
+      background: rgba(20, 33, 29, 0.025);
+    }}
+    tbody tr:hover td {{
+      background: rgba(75, 145, 125, 0.08);
     }}
     td.empty {{
       text-align: center;
-      color: var(--muted);
-      padding: 18px;
+      color: var(--ink-soft);
+      padding: 22px;
     }}
     ul {{
       margin: 0;
-      padding-left: 18px;
+      padding: 0;
+      list-style: none;
       line-height: 1.8;
     }}
     li + li {{
-      margin-top: 8px;
+      margin-top: 10px;
+    }}
+    li {{
+      position: relative;
+      padding-left: 18px;
+      color: inherit;
+    }}
+    li::before {{
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0.78em;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      transform: translateY(-50%);
+      box-shadow: 0 0 0 4px rgba(75, 145, 125, 0.12);
     }}
     .command-grid {{
       display: grid;
-      gap: 12px;
+      gap: 14px;
+      margin-top: 18px;
     }}
     .command-card {{
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 14px;
-      background: rgba(8, 24, 19, 0.7);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 20px;
+      padding: 16px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01)),
+        #101513;
+      color: #eef4ed;
     }}
     .command-target {{
       font-size: 11px;
-      color: var(--muted);
+      color: rgba(239, 244, 237, 0.6);
       margin-bottom: 8px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.16em;
       text-transform: uppercase;
     }}
     .command-line {{
       font-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
       font-size: 13px;
-      color: var(--accent-bright);
+      color: #cde9df;
       margin-bottom: 10px;
       font-weight: 600;
     }}
@@ -4313,8 +5932,8 @@ def render_html_report(
       margin: 0;
       padding: 12px;
       border-radius: 14px;
-      background: #081715;
-      color: #dbfff2;
+      background: rgba(255,255,255,0.05);
+      color: #edf5ef;
       overflow-x: auto;
       white-space: pre-wrap;
       word-break: break-word;
@@ -4326,18 +5945,18 @@ def render_html_report(
       padding: 16px;
       border: 1px dashed var(--line);
       border-radius: 16px;
-      color: var(--muted);
-      background: rgba(8, 24, 19, 0.54);
+      color: var(--ink-soft);
+      background: rgba(255,255,255,0.36);
     }}
     .notice-block {{
-      margin-top: 14px;
-      padding: 12px 14px;
-      border-radius: 16px;
-      border: 1px solid rgba(247, 197, 109, 0.3);
-      background: rgba(247, 197, 109, 0.08);
-      color: #f5d79a;
-      font-size: 12px;
-      line-height: 1.7;
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(168, 109, 50, 0.22);
+      background: rgba(168, 109, 50, 0.09);
+      color: #6a4a27;
+      font-size: 13px;
+      line-height: 1.78;
     }}
     .notice-block p {{
       margin: 0 0 6px;
@@ -4351,7 +5970,7 @@ def render_html_report(
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 14px;
+      margin-top: 16px;
     }}
     .runtime-pill,
     .signal-pill {{
@@ -4361,18 +5980,26 @@ def render_html_report(
       padding: 8px 12px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: rgba(126, 240, 199, 0.08);
-      color: var(--ink);
+      background: rgba(255,255,255,0.44);
+      color: inherit;
       font-size: 12px;
       line-height: 1.5;
+    }}
+    .panel-dark .runtime-pill,
+    .panel-dark .signal-pill,
+    .meta-card.dark .runtime-pill,
+    .meta-card.dark .signal-pill {{
+      border-color: rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.08);
+      color: #eff4ed;
     }}
     .footer-bar {{
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       gap: 12px;
-      padding: 0 18px 18px;
-      color: var(--muted);
+      padding: 0 24px 24px;
+      color: var(--ink-faint);
       font-size: 12px;
       line-height: 1.7;
     }}
@@ -4384,26 +6011,37 @@ def render_html_report(
       .report-shell {{
         padding: 30px 20px 56px;
       }}
-      .hero {{
-        padding: 32px 26px 24px;
+      .top-ribbon {{
+        padding: 22px 30px 0;
       }}
-      .panel-grid {{
-        padding: 18px;
+      .hero {{
+        padding: 22px 30px 12px;
       }}
       .command-grid {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
+      .section-flow {{
+        padding: 10px 30px 30px;
+      }}
+      .summary-board {{
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }}
     }}
-    @media (min-width: 960px) {{
+    @media (min-width: 980px) {{
       .hero-grid {{
-        grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+        grid-template-columns: minmax(0, 1.45fr) minmax(330px, 0.7fr);
         align-items: start;
       }}
-      .hero-meta {{
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+      .section-heading {{
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: end;
+        gap: 20px;
       }}
       .metrics {{
         grid-template-columns: repeat(4, minmax(0, 1fr));
+      }}
+      .meta-board {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
       .panel-grid {{
         grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -4431,6 +6069,9 @@ def render_html_report(
       body {{
         background: #fff;
       }}
+      body::before {{
+        display: none;
+      }}
       .report-shell {{
         margin: 0;
         padding: 0;
@@ -4441,6 +6082,18 @@ def render_html_report(
         border-radius: 0;
         box-shadow: none;
       }}
+      .hero-intro,
+      .panel-dark,
+      .meta-card.dark,
+      th,
+      .command-card,
+      pre {{
+        color: #111 !important;
+        background: #fff !important;
+      }}
+      th {{
+        position: static !important;
+      }}
       .panel,
       .meta-card,
       .metric-card,
@@ -4449,56 +6102,104 @@ def render_html_report(
         break-inside: avoid;
       }}
     }}
+    @media (prefers-reduced-motion: reduce) {{
+      .hero-intro,
+      .hero-side > *,
+      .panel-grid > *,
+      .meta-card,
+      .panel {{
+        animation: none !important;
+        transition: none !important;
+        transform: none !important;
+      }}
+    }}
   </style>
 </head>
 <body>
   <main class="report-shell">
     <div class="report-frame">
+      <div class="top-ribbon">
+        <div>JumpServer / Inspection Dossier</div>
+        <div>{escape(metadata['company'])} / Generated {escape(metadata['generated_at'])}</div>
+      </div>
+
       <header class="hero">
         <div class="hero-grid">
-          <section>
-            <p class="eyebrow">JumpServer Inspection Console</p>
+          <section class="hero-intro">
+            <p class="eyebrow">JumpServer Inspection Brief</p>
             {render_risk_badge(context['risk_level'])}
             <h1>{escape(metadata['title'])}</h1>
-            <p class="hero-summary">面向堡垒机值班、运维巡检和安全汇报的控制台化日报，聚焦账号访问、资产状态、命令证据与审计风险，优先保证手机端快速浏览。</p>
-            <div class="hero-meta">
-              <div class="meta-card"><span class="meta-label">统计区间</span><div class="meta-value">{escape(context['report_range'])}</div></div>
-              <div class="meta-card"><span class="meta-label">环境 Profile</span><div class="meta-value">{escape(metadata['profile_name'])}</div></div>
-              <div class="meta-card"><span class="meta-label">组织范围</span><div class="meta-value">{escape(metadata['scope_name'])}</div></div>
-              <div class="meta-card"><span class="meta-label">平台版本</span><div class="meta-value">{escape(metadata['version'])}</div></div>
+            <p class="hero-summary">{escape(dispatch_message)}</p>
+            <p class="hero-lead">{coverage_summary}</p>
+            <div class="hero-foot">
+              <span class="hero-chip">Profile / {escape(metadata['profile_name'])}</span>
+              <span class="hero-chip">Scope / {escape(metadata['scope_name'])}</span>
+              <span class="hero-chip">Version / {escape(metadata['version'])}</span>
+              <span class="hero-chip">Window / {escape(context['report_range'])}</span>
             </div>
+            {render_anchor_nav(section_nav)}
           </section>
-          <aside class="panel panel-subtle hero-side">
-            <div class="panel-body">
-              <p class="panel-kicker">Overview</p>
-              <h2>巡检概览</h2>
-              <p class="panel-summary">当前巡检范围、风险等级与采集结果摘要。</p>
+          <aside class="hero-side">
+            <section class="meta-card featured hero-stack">
+              <span class="meta-label">Executive Snapshot</span>
+              <div class="meta-value">值班总览</div>
+              <p class="meta-note">把最先需要看的一层信息压缩到首页右侧，适合转发给值班、运维和安全负责人。</p>
               {render_html_list(context['executive_summary_items'])}
-              <div class="runtime-list">
-                <span class="runtime-pill">生成时间：{escape(metadata['generated_at'])}</span>
-                <span class="runtime-pill">JumpServer：{escape(metadata['base_url'])}</span>
+            </section>
+            <section class="meta-card dark hero-stack">
+              <span class="meta-label">Report Identity</span>
+              <div class="meta-board">
+                <div class="meta-tile">
+                  <span class="meta-name">统计区间</span>
+                  <span class="meta-copy">{escape(context['report_range'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">生成时间</span>
+                  <span class="meta-copy">{escape(metadata['generated_at'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">客户</span>
+                  <span class="meta-copy">{escape(metadata['customer'])}</span>
+                </div>
+                <div class="meta-tile">
+                  <span class="meta-name">JumpServer</span>
+                  <span class="meta-copy">{escape(metadata['base_url'])}</span>
+                </div>
               </div>
-            </div>
+              <div class="runtime-list">
+                <span class="runtime-pill">Company：{escape(metadata['company'])}</span>
+                <span class="runtime-pill">Theme：{escape(metadata['theme_color'])}</span>
+              </div>
+            </section>
           </aside>
         </div>
         {render_notice_block(context.get('report_notice_items', []))}
       </header>
 
-      <section class="panel-grid">
-        <article class="panel span-12">
+      <section class="section-flow" id="situation">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">01 / Situation</div>
+            <h2 class="section-title">态势总览</h2>
+          </div>
+          <p class="section-caption">先给出风险级别、异常聚焦和最值得注意的结论，减少用户在长报告里自己找重点的成本。</p>
+        </div>
+        {render_summary_callouts(summary_callouts)}
+        <div class="panel-grid">
+        <article class="panel panel-strong span-12">
           <div class="panel-body">
             <p class="panel-kicker">Security Posture</p>
             <h2>核心态势指标</h2>
-            <p class="panel-summary">使用移动端优先的指标卡展示风险、登录、会话与审计状态。</p>
+            <p class="panel-summary">将风险、登录、会话、命令巡检和审计记录压缩成一排可快速扫描的指标卡。</p>
             <div class="metrics">{render_metric_cards(overview_cards)}</div>
           </div>
         </article>
 
-        <article class="panel span-8">
+        <article class="panel span-7">
           <div class="panel-body">
             <p class="panel-kicker">Focus</p>
             <h2>异常聚焦</h2>
-            <p class="panel-summary">按登录失败、异常资产、高风险会话与命令巡检异常合并输出巡检焦点。</p>
+            <p class="panel-summary">合并登录失败、异常资产、高风险会话与命令巡检异常，作为值班排查的第一入口。</p>
             {render_html_table_block(
                 [("异常等级", "level"), ("异常节点", "node"), ("异常描述", "description")],
                 anomaly_rows,
@@ -4507,11 +6208,11 @@ def render_html_report(
           </div>
         </article>
 
-        <article class="panel panel-subtle span-4">
+        <article class="panel panel-dark span-5">
           <div class="panel-body">
             <p class="panel-kicker">Findings</p>
             <h2>关键发现</h2>
-            <p class="panel-summary">适合在手机端快速定位的重点结论。</p>
+            <p class="panel-summary">把当日最值得在晨会或交班里直接引用的结论单独摘出来。</p>
             {render_html_list(context['key_findings_items'])}
             <div class="signal-list">
               <span class="signal-pill">客户：{escape(metadata['customer'])}</span>
@@ -4520,20 +6221,53 @@ def render_html_report(
           </div>
         </article>
 
+        <article class="panel span-7">
+          <div class="panel-body">
+            <p class="panel-kicker">Risk Surface</p>
+            <h2>安全风险摘要</h2>
+            <p class="panel-summary">汇总爆破线索、高风险会话、命令异常和危险操作，形成可交付的风险面概览。</p>
+            {render_html_list(context['security_risk_items'], "今日未识别出显著安全风险。")}
+          </div>
+        </article>
+
         <article class="panel span-5">
+          <div class="panel-body">
+            <p class="panel-kicker">Assets</p>
+            <h2>资产状态</h2>
+            <p class="panel-summary">展示纳管资产基础状态，便于在总览层先确认平台覆盖面与异常资产分布。</p>
+            {render_html_table_block(
+                scoped_headers([("机器名", "name"), ("机器类型", "platform"), ("机器 IP", "ip"), ("机器端口", "port"), ("SSH 用户名", "username"), ("是否有效", "enabled"), ("状态", "status")], asset_rows),
+                asset_rows,
+                "当前未查询到资产数据。"
+            )}
+          </div>
+        </article>
+        </div>
+      </section>
+
+      <section class="section-flow" id="evidence">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">02 / Evidence</div>
+            <h2 class="section-title">主机证据</h2>
+          </div>
+          <p class="section-caption">把命令巡检摘要、磁盘高水位和原始命令输出放在同一层，方便快速复核采集链路与系统运行态。</p>
+        </div>
+        <div class="panel-grid">
+        <article class="panel span-4">
           <div class="panel-body">
             <p class="panel-kicker">Command Inspection</p>
             <h2>系统命令巡检</h2>
-            <p class="panel-summary">主机级证据摘要，适合堡垒机巡检场景快速确认命令采集是否成功。</p>
+            <p class="panel-summary">主机级证据摘要，适合先确认命令采集成功率、异常数量与目标覆盖情况。</p>
             {render_html_list(context['command_stats']['summary_items'], "当前未配置系统命令巡检。")}
           </div>
         </article>
 
-        <article class="panel span-7">
+        <article class="panel span-8">
           <div class="panel-body">
             <p class="panel-kicker">Filesystem</p>
             <h2>磁盘使用率</h2>
-            <p class="panel-summary">聚焦 `df -Th` 结果中的高水位挂载点，异常文件系统会在态势卡中继续标注。</p>
+            <p class="panel-summary">聚焦 `df -Th` 结果中的高水位挂载点，异常文件系统通常是故障前的第一类信号。</p>
             {render_html_table_block(
                 [("节点", "target_name"), ("文件系统", "filesystem"), ("类型", "type"), ("总量", "size"), ("已用", "used"), ("可用", "avail"), ("使用率", "usage"), ("挂载点", "mount")],
                 [
@@ -4554,20 +6288,31 @@ def render_html_report(
           </div>
         </article>
 
-        <article class="panel span-12">
+        <article class="panel panel-dark span-12">
           <div class="panel-body">
             <p class="panel-kicker">Evidence</p>
             <h2>命令输出样本</h2>
-            <p class="panel-summary">保留关键命令原始输出，便于复核运行态与采集链路。</p>
+            <p class="panel-summary">保留关键命令原始输出，供运维和安全侧在不切回终端的情况下直接复核证据。</p>
             <div class="command-grid">{render_command_cards(command_rows)}</div>
           </div>
         </article>
+        </div>
+      </section>
 
+      <section class="section-flow" id="audit">
+        <div class="section-heading">
+          <div>
+            <div class="section-index">03 / Access And Audit</div>
+            <h2 class="section-title">访问与审计</h2>
+          </div>
+          <p class="section-caption">最后展开账号访问、在线会话和高风险操作，既适合当天排查，也适合作为归档版巡检日报。</p>
+        </div>
+        <div class="panel-grid">
         <article class="panel span-6">
           <div class="panel-body">
             <p class="panel-kicker">Access</p>
             <h2>登录异常</h2>
-            <p class="panel-summary">优先展示失败明细，便于判断是否存在爆破、凭据异常或误配置。</p>
+            <p class="panel-summary">优先展示失败明细，便于判断是否存在爆破、凭据异常、误配置或接入侧故障。</p>
             {render_html_table_block(
                 scoped_headers([("时间", "time"), ("用户", "username"), ("来源 IP", "ip"), ("原因", "message")], login_failure_rows),
                 login_failure_rows,
@@ -4580,7 +6325,7 @@ def render_html_report(
           <div class="panel-body">
             <p class="panel-kicker">Session</p>
             <h2>活跃会话</h2>
-            <p class="panel-summary">聚焦当前在线连接与来源地址，方便手机端临时排查。</p>
+            <p class="panel-summary">聚焦当前在线连接与来源地址，适合值班人员临时排查敏感时段和异常来源。</p>
             {render_html_table_block(
                 scoped_headers([("用户", "username"), ("目标资产", "asset"), ("来源 IP", "remote_addr"), ("协议", "protocol"), ("开始时间", "start_at")], session_rows),
                 session_rows,
@@ -4591,31 +6336,9 @@ def render_html_report(
 
         <article class="panel span-7">
           <div class="panel-body">
-            <p class="panel-kicker">Assets</p>
-            <h2>资产状态</h2>
-            <p class="panel-summary">展示纳管资产基础状态，异常资产会在态势聚焦中同步提示。</p>
-            {render_html_table_block(
-                scoped_headers([("机器名", "name"), ("机器类型", "platform"), ("机器 IP", "ip"), ("机器端口", "port"), ("SSH 用户名", "username"), ("是否有效", "enabled"), ("状态", "status")], asset_rows),
-                asset_rows,
-                "当前未查询到资产数据。"
-            )}
-          </div>
-        </article>
-
-        <article class="panel span-5">
-          <div class="panel-body">
-            <p class="panel-kicker">Risk</p>
-            <h2>安全风险摘要</h2>
-            <p class="panel-summary">汇总爆破线索、高风险会话、命令异常与危险操作等风险面。</p>
-            {render_html_list(context['security_risk_items'], "今日未识别出显著安全风险。")}
-          </div>
-        </article>
-
-        <article class="panel span-7">
-          <div class="panel-body">
             <p class="panel-kicker">Audit</p>
             <h2>高风险操作审计</h2>
-            <p class="panel-summary">提取 delete/remove/drop 等高风险动作，适合值班场景快速复核。</p>
+            <p class="panel-summary">提取 delete、remove、drop 等高风险动作，适合作为值班复核和留痕依据。</p>
             {render_html_table_block(
                 scoped_headers([("时间", "time"), ("用户", "username"), ("动作", "action"), ("对象", "target")], dangerous_rows),
                 dangerous_rows,
@@ -4624,20 +6347,20 @@ def render_html_report(
           </div>
         </article>
 
-        <article class="panel panel-subtle span-5">
+        <article class="panel panel-dark span-5">
           <div class="panel-body">
             <p class="panel-kicker">Action</p>
             <h2>处置建议</h2>
-            <p class="panel-summary">按当前风险面给出可直接执行的巡检后续动作。</p>
+            <p class="panel-summary">按当前风险面给出可直接执行的后续动作，适合交班时抄走就用。</p>
             {render_html_list(context['recommendation_items'])}
           </div>
         </article>
 
-        <article class="panel panel-subtle span-12">
+        <article class="panel span-12">
           <div class="panel-body">
             <p class="panel-kicker">Runtime</p>
             <h2>巡检说明</h2>
-            <p class="panel-summary">记录采集来源、输出链路与运行上下文，便于归档和转发。</p>
+            <p class="panel-summary">记录采集来源、输出链路与运行上下文，便于归档、转发和后续复跑追踪。</p>
             {render_html_list(context['report_notice_items'], "本次巡检数据采集与渲染链路正常。")}
             <div class="runtime-list">
               <span class="runtime-pill">Profile：{escape(metadata['profile_name'])}</span>
@@ -4647,6 +6370,7 @@ def render_html_report(
             </div>
           </div>
         </article>
+        </div>
       </section>
 
       <div class="footer-bar">
@@ -5404,7 +7128,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         operates, operates_error = safe_fetch(lambda: get_operate_logs(args.date or today_str(), org_id=org_id), "操作审计接口不可用")
         command_state = get_command_target_state()
         command_targets = command_state.get("targets", [])
-        command_error = get_command_execution_error()
+        command_error = get_command_execution_error(command_targets)
         legacy_state = get_legacy_system_target_state()
         legacy_targets = legacy_state.get("targets", [])
         legacy_remote_config_ready = False
@@ -5494,7 +7218,7 @@ def cmd_exec_commands(args: argparse.Namespace) -> int:
             targets = [item for item in targets if item["name"] == args.target]
         if not targets:
             raise JumpServerApiError("当前 profile 未配置可执行的命令巡检目标")
-        precheck_error = get_command_execution_error()
+        precheck_error = get_command_execution_error(targets)
         if precheck_error:
             raise JumpServerApiError(precheck_error)
 
@@ -5589,6 +7313,60 @@ def cmd_ensure_deps(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    try:
+        ensure_parent_dir((PROFILE_DIR / ".gitkeep").resolve())
+        ensure_parent_dir((REPORT_DIR / ".gitkeep").resolve())
+        PLAYWRIGHT_BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
+        created_profile = False
+        profile_path: Optional[Path] = None
+        if args.profile:
+            profile_path, created_profile = ensure_profile_from_example(args.profile, overwrite=args.overwrite_profile)
+            activate_profile(args.profile)
+
+        groups = ["db", "exec", "docx"]
+        if args.include_pdf:
+            groups.append("pdf")
+        deps_result = bootstrap_dependency_groups(groups)
+        pending_profile_keys = detect_pending_profile_keys(profile_path)
+
+        command_runtime_ready = False
+        command_runtime_error = None
+        try:
+            ensure_command_runtime_ready()
+            command_runtime_ready = True
+        except Exception as exc:  # noqa: BLE001
+            command_runtime_error = str(exc)
+
+        payload = {
+            "profile": args.profile,
+            "profile_file": str(profile_path) if profile_path else None,
+            "profile_created": created_profile,
+            "pending_profile_keys": pending_profile_keys,
+            "dependency_groups": groups,
+            "dependencies": deps_result,
+            "command_runtime_ready": command_runtime_ready,
+            "command_runtime_error": command_runtime_error,
+            "playwright_browsers_path": str(PLAYWRIGHT_BROWSERS_DIR),
+            "notes": [
+                "bootstrap 默认安装 db+exec+docx，避免 fresh install 一上来就被 pdf/libreoffice 阻塞。",
+                "如需 PDF 模板补全，再追加 --include-pdf 或单独执行 ensure-deps pdf。",
+                "playwright/chromium 浏览器缓存默认落在 runtime/.playwright-browsers，避免依赖用户全局缓存目录。",
+            ],
+            "next_steps": [
+                f"编辑 {profile_path} 补齐 {', '.join(pending_profile_keys)}" if profile_path and pending_profile_keys else "",
+                f"python3 scripts/jms_inspection.py list-orgs --profile {args.profile}" if args.profile else "",
+                f"python3 scripts/jms_inspection.py self-test --profile {args.profile} --date {today_str()}" if args.profile else "",
+            ],
+        }
+        payload["next_steps"] = [item for item in payload["next_steps"] if item]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if command_runtime_ready and not deps_result.get("failed_groups") else 1
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc) or DEFAULT_ERROR_MESSAGE, file=sys.stderr)
+        return 1
+
+
 def add_org_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--org-name", help="组织名称，精确匹配或唯一模糊匹配后执行")
     parser.add_argument("--all-orgs", action="store_true", help="对全部组织执行，输出先总览再分组织")
@@ -5598,6 +7376,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="JumpServer 巡检报告生成与定时推送工具")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_bootstrap = sub.add_parser("bootstrap", help="首次安装自举：准备 profile、运行时依赖与命令执行环境")
+    p_bootstrap.add_argument("--profile", help="环境 profile 名称或 env 文件路径；传入时不存在则自动从 .env.example 创建")
+    p_bootstrap.add_argument("--overwrite-profile", action="store_true", help="若 profile 已存在，允许用 .env.example 覆盖")
+    p_bootstrap.add_argument("--include-pdf", action="store_true", help="额外安装 PDF 模板补全依赖，可能触发 libreoffice 安装")
+    p_bootstrap.set_defaults(func=cmd_bootstrap)
+
     p_report = sub.add_parser("report", help="推荐入口：固定三个参数生成巡检报告")
     p_report.add_argument("profile", help="环境 profile 名称或 env 文件路径")
     p_report.add_argument("date", help="报告日期，格式 YYYY-MM-DD")
@@ -5606,7 +7390,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--output-file", help="输出文件路径；留空时写入 runtime/reports/<profile>/")
     p_report.add_argument("--from", dest="from_date", help="报告开始日期，格式 YYYY-MM-DD；留空时按单日报告处理")
     p_report.add_argument("--to", dest="to_date", help="报告结束日期，格式 YYYY-MM-DD；留空时默认等于位置参数 date")
-    p_report.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式，默认 legacy 对齐旧巡检文档字段")
+    p_report.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为正式完整版，modern 为控制台摘要版")
     add_org_scope_args(p_report)
     p_report.set_defaults(func=cmd_report)
 
@@ -5618,7 +7402,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_generate.add_argument("--output-file", help="输出文件路径；留空时写入 runtime/last_report.md 或 runtime/last_report.html")
     p_generate.add_argument("--from", dest="from_date", help="报告开始日期，格式 YYYY-MM-DD；留空时按单日报告处理")
     p_generate.add_argument("--to", dest="to_date", help="报告结束日期，格式 YYYY-MM-DD；留空时默认等于 --date 或今天")
-    p_generate.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式，默认 legacy 对齐旧巡检文档字段")
+    p_generate.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为正式完整版，modern 为控制台摘要版")
     add_org_scope_args(p_generate)
     p_generate.set_defaults(func=cmd_generate)
 
