@@ -8,6 +8,8 @@
   - `JUMPSERVER_PASSWORD`
   - `JumpServer_IP`
   - `JMS_EXEC_ACCOUNT_NAME`，未说明时默认 `root`
+  - `JMS_OFFICIAL_SSH_USERNAME`
+  - `JMS_OFFICIAL_SSH_PASSWORD`
 - 首次把追问得到的配置写回 env/profile：
   - `python3 scripts/jms_inspection.py save-config --profile <profile> KEY=VALUE [KEY=VALUE ...]`
 - 正式报告：
@@ -23,7 +25,7 @@
 - 模板补全：
   - `python3 scripts/jms_inspection.py fill-template --profile <profile> --from <YYYY-MM-DD> --to <YYYY-MM-DD> --input-file <doc|docx|pdf> [--output-file ...]`
 - 依赖安装：
-  - `python3 scripts/jms_inspection.py ensure-deps db|exec|docx|pdf|all`
+  - `python3 scripts/jms_inspection.py ensure-deps db|exec|docx|official|pdf|all`
   - fresh install 更推荐先执行 `python3 scripts/jms_inspection.py bootstrap --profile <profile>`
 
 ## 组织范围规则
@@ -48,12 +50,19 @@
 - `JMS_AUTO_INSTALL=true` 时，脚本会优先尝试自动安装缺失依赖
 - Python 依赖安装到 `runtime/.venv`
 - 命令巡检依赖 `playwright`
+- official legacy 远程执行依赖 `paramiko`
 - Playwright 浏览器缓存默认安装到 `runtime/.playwright-browsers`
 - `.doc` 转 `.docx` 依赖 `libreoffice/soffice`
-- `legacy` 报告依赖 `JMS_SYSTEM_TARGETS`
+- `legacy` 默认走 `JMS_LEGACY_PROVIDER=official`
+- official 巡检二进制默认从 `assets/bin/linux_amd64/jms_inspect` 准备到 `runtime/bin/jms_inspect`
 - 数据库查询依赖 `PyMySQL[rsa]`；若目标库使用 MySQL 8 默认鉴权，还依赖 `cryptography`
-- `bootstrap` 默认安装 `db + exec + docx`，避免第一次就因 `pdf/libreoffice` 卡住
+- `bootstrap` 默认安装 `db + exec + docx + official`，避免第一次执行时再按需补装
 - fresh install 的依赖恢复默认带重试和更长浏览器下载超时；若环境出网受限，可在 profile 里补 `HTTPS_PROXY/HTTP_PROXY/PLAYWRIGHT_DOWNLOAD_HOST`
+- official 远程报告至少还需要 `JumpServer_IP`、`JMS_OFFICIAL_SSH_USERNAME`、`JMS_OFFICIAL_SSH_PASSWORD`
+- `JMS_OFFICIAL_SSH_PORT` 默认 `22`
+- `JMS_OFFICIAL_PRIVILEGE_TYPE` 仅支持空值、`sudo`、`su -`
+- `JMS_OFFICIAL_REMOTE_CONFIG_PATH` 默认 `/opt/jumpserver/config/config.txt`
+- 若显式设置 `JMS_LEGACY_PROVIDER=python`，才会回退旧 Python legacy 数据链路
 - `JMS_SYSTEM_TARGETS` 为 JSON 数组，每项至少包含 `name`、`asset_name`、`account_name`、`role`
 - 未配置 `JMS_SYSTEM_TARGETS` 时，会优先复用 `JumpServer_IP / JMS_EXEC_ACCOUNT_NAME`
 - 仍未配置时，才会从 `JUMPSERVER_URL` 解析域名/IP，并尝试把该服务 IP 当作默认巡检节点
@@ -64,8 +73,9 @@
 ## 结果输出
 
 - `report ... html` 写到 `runtime/reports/<profile>/JumpServer巡检报告_<timestamp>.html`
+- official legacy 同时会在同目录生成 `JumpServer巡检报告_<timestamp>_official_bundle/`，保存回收的 HTML/JSON/Excel 与 metadata
 - `report ... markdown` 写到 `runtime/reports/<profile>/JumpServer巡检报告_<timestamp>.md`
-- `report ... html` 默认输出新版正式巡检完整版 HTML
+- `report ... html` 默认输出 official legacy 正式巡检完整版 HTML
 - `report ... html --style modern` 输出新版控制台摘要版
 - `report ... --from ... --to ...` 仍只生成一份汇总报告，不拆成多份
 - `fill-template` 默认写到 `runtime/filled_templates/`

@@ -8,7 +8,9 @@ import hmac
 import importlib
 import json
 import os
+import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -34,6 +36,8 @@ DEFAULT_TOP_N = 10
 DEFAULT_INSTALL_RETRIES = 3
 DEFAULT_PIP_TIMEOUT = 120
 DEFAULT_PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS = 180000
+DEFAULT_PLAYWRIGHT_CFT_DOWNLOAD_HOST = "https://storage.googleapis.com/chrome-for-testing-public"
+DEFAULT_PLAYWRIGHT_CFT_CDN_HOST = "https://cdn.playwright.dev/chrome-for-testing-public"
 ROOT_ORG_ID = "00000000-0000-0000-0000-000000000000"
 ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1B\][^\x07]*(?:\x07|\x1B\\)")
@@ -60,6 +64,8 @@ RUNTIME_DIR = SKILL_DIR / "runtime"
 PROFILE_DIR = RUNTIME_DIR / "profiles"
 REPORT_DIR = RUNTIME_DIR / "reports"
 EXAMPLE_ENV_FILE = SKILL_DIR / ".env.example"
+THIRD_PARTY_DIR = SKILL_DIR / "third_party"
+OFFICIAL_SRC_DIR = THIRD_PARTY_DIR / "jms-inspect-go"
 
 BUILTIN_DAILY_TEMPLATE_FILE = TEMPLATE_DIR / "daily.md"
 BUILTIN_EXECUTIVE_TEMPLATE_FILE = TEMPLATE_DIR / "executive.md"
@@ -68,11 +74,17 @@ DEFAULT_STATE_FILE = RUNTIME_DIR / "scheduler_state.json"
 DEFAULT_OUTPUT_FILE = RUNTIME_DIR / "last_report.md"
 DEFAULT_HTML_OUTPUT_FILE = RUNTIME_DIR / "last_report.html"
 RUNTIME_VENV_DIR = RUNTIME_DIR / ".venv"
+RUNTIME_BIN_DIR = RUNTIME_DIR / "bin"
+RUNTIME_OFFICIAL_BINARY = RUNTIME_BIN_DIR / "jms_inspect"
 PLAYWRIGHT_BROWSERS_DIR = RUNTIME_DIR / ".playwright-browsers"
 FILLED_TEMPLATE_DIR = RUNTIME_DIR / "filled_templates"
 LEGACY_COMMAND_FILE = COMMANDS_DIR / "legacy_system.txt"
 DEFAULT_REMOTE_CONFIG_FILE = "/opt/jumpserver/config/config.txt"
 MISSING_COMMAND_OUTPUT = "未采集到命令输出。"
+OFFICIAL_BINARY_ASSET = ASSETS_DIR / "bin" / "linux_amd64" / "jms_inspect"
+DEFAULT_LEGACY_PROVIDER = "official"
+OFFICIAL_REMOTE_SYSTEM = "linux"
+OFFICIAL_REMOTE_ARCHES = {"x86_64", "amd64"}
 
 RUNTIME_PROFILE: Dict[str, Any] = {
     "name": "shell",
@@ -90,11 +102,16 @@ OPTIONAL_DEPENDENCIES: Dict[str, Dict[str, Any]] = {
     },
     "exec": {
         "python": ["playwright"],
-        "post_install": [["-m", "playwright", "install", "chromium"]],
+        "post_install": [],
         "system": [],
     },
     "docx": {
         "python": ["python-docx"],
+        "post_install": [],
+        "system": [],
+    },
+    "official": {
+        "python": ["paramiko"],
         "post_install": [],
         "system": [],
     },
@@ -148,6 +165,105 @@ def build_runtime_process_env(extra: Optional[Dict[str, Any]] = None) -> Dict[st
                 continue
             env[str(key)] = str(value)
     return env
+
+
+def supports_playwright_cft_download_host() -> bool:
+    system_name = platform.system().lower()
+    machine = platform.machine().lower()
+    if system_name == "darwin":
+        return machine in {"arm64", "x86_64"}
+    if system_name == "linux":
+        return machine in {"x86_64", "amd64"}
+    if system_name == "windows":
+        return machine in {"x86_64", "amd64"}
+    return False
+
+
+def find_system_chromium_executable() -> Optional[str]:
+    candidates: List[str] = []
+    for binary in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+        "msedge",
+    ):
+        path = shutil.which(binary)
+        if path:
+            candidates.append(path)
+    candidates.extend([
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ])
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if Path(normalized).exists():
+            return normalized
+    return None
+
+
+def get_playwright_download_host_candidates(env: Dict[str, str]) -> List[str]:
+    explicit_hosts: List[str] = []
+    for key in ("PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST", "PLAYWRIGHT_DOWNLOAD_HOST"):
+        value = str(env.get(key) or "").strip().rstrip("/")
+        if value and value not in explicit_hosts:
+            explicit_hosts.append(value)
+    if explicit_hosts:
+        return explicit_hosts
+    hosts: List[str] = []
+    if supports_playwright_cft_download_host():
+        hosts.extend([
+            DEFAULT_PLAYWRIGHT_CFT_DOWNLOAD_HOST,
+            DEFAULT_PLAYWRIGHT_CFT_CDN_HOST,
+        ])
+    hosts.append("")
+    ordered: List[str] = []
+    for host in hosts:
+        if host in ordered:
+            continue
+        ordered.append(host)
+    return ordered
+
+
+def install_playwright_chromium_runtime(python_path: Path, install_env: Dict[str, str]) -> List[str]:
+    system_browser = find_system_chromium_executable()
+    if system_browser:
+        return [f"reuse-system-chromium {system_browser}"]
+
+    attempted_hosts: List[str] = []
+    last_error: Optional[Exception] = None
+    for host in get_playwright_download_host_candidates(install_env):
+        env = dict(install_env)
+        label = host or "playwright-default"
+        if host:
+            env["PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST"] = host
+            env.pop("PLAYWRIGHT_DOWNLOAD_HOST", None)
+        description = f"执行 `exec` 后置安装（Chromium 下载源：{label}）"
+        try:
+            run_subprocess(
+                [str(python_path), "-m", "playwright", "install", "chromium"],
+                description,
+                retries=1,
+                env=env,
+            )
+            return [f"python -m playwright install chromium @ {label}"]
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            attempted_hosts.append(label)
+
+    attempted_text = ", ".join(attempted_hosts) if attempted_hosts else "无"
+    raise JumpServerApiError(
+        "执行 `exec` 后置安装失败，已尝试这些 Chromium 下载源："
+        f"{attempted_text}。可优先安装系统 Chrome/Chromium，或在 profile 中设置 "
+        "`PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` / `HTTPS_PROXY` 后重试。"
+    ) from last_error
 
 
 def run_subprocess(command: List[str], description: str, retries: int = 1, env: Optional[Dict[str, str]] = None) -> None:
@@ -328,6 +444,8 @@ def bootstrap_required_profile_keys() -> List[str]:
         "JUMPSERVER_USERNAME",
         "JUMPSERVER_PASSWORD",
         "JumpServer_IP",
+        "JMS_OFFICIAL_SSH_USERNAME",
+        "JMS_OFFICIAL_SSH_PASSWORD",
         "JMS_EXEC_ACCOUNT_NAME",
     ]
 
@@ -343,6 +461,8 @@ def detect_pending_profile_keys(path: Optional[Path]) -> List[str]:
         "JUMPSERVER_USERNAME": {"", "admin"},
         "JUMPSERVER_PASSWORD": {"", "change_me"},
         "JumpServer_IP": {"", "jumpserver-host"},
+        "JMS_OFFICIAL_SSH_USERNAME": {"", "root"},
+        "JMS_OFFICIAL_SSH_PASSWORD": {"", "change_me"},
         "JMS_EXEC_ACCOUNT_NAME": {"", "root"},
     }
     pending: List[str] = []
@@ -636,6 +756,101 @@ def get_jumpserver_ip_value() -> str:
         if value:
             return value
     return ""
+
+
+def get_legacy_provider() -> str:
+    provider = (get_runtime_env("JMS_LEGACY_PROVIDER", DEFAULT_LEGACY_PROVIDER) or DEFAULT_LEGACY_PROVIDER).strip().lower()
+    if provider not in ("official", "python"):
+        return DEFAULT_LEGACY_PROVIDER
+    return provider
+
+
+def resolve_official_binary_source() -> Path:
+    configured = get_runtime_env("JMS_OFFICIAL_BINARY_PATH")
+    path = Path(configured).expanduser().resolve() if configured else OFFICIAL_BINARY_ASSET.resolve()
+    if not path.exists():
+        raise JumpServerApiError(
+            f"未找到 official 巡检二进制：{path}。请先执行 `python3 scripts/jms_inspection.py bootstrap --profile <profile>`。"
+        )
+    return path
+
+
+def prepare_official_runtime_binary() -> Dict[str, Any]:
+    source = resolve_official_binary_source()
+    ensure_parent_dir(RUNTIME_OFFICIAL_BINARY)
+    shutil.copyfile(source, RUNTIME_OFFICIAL_BINARY)
+    try:
+        RUNTIME_OFFICIAL_BINARY.chmod(0o755)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "source": str(source),
+        "runtime_path": str(RUNTIME_OFFICIAL_BINARY),
+        "local_platform": f"{platform.system().lower()}/{platform.machine().lower()}",
+    }
+
+
+def get_official_ssh_config() -> Dict[str, Any]:
+    host = get_jumpserver_ip_value()
+    port = get_runtime_env("JMS_OFFICIAL_SSH_PORT", "22") or "22"
+    username = get_runtime_env("JMS_OFFICIAL_SSH_USERNAME")
+    password = get_runtime_env("JMS_OFFICIAL_SSH_PASSWORD")
+    privilege_type = get_runtime_env("JMS_OFFICIAL_PRIVILEGE_TYPE")
+    privilege_password = get_runtime_env("JMS_OFFICIAL_PRIVILEGE_PASSWORD")
+    remote_config_path = get_runtime_env("JMS_OFFICIAL_REMOTE_CONFIG_PATH", DEFAULT_REMOTE_CONFIG_FILE) or DEFAULT_REMOTE_CONFIG_FILE
+
+    missing: List[str] = []
+    if not host:
+        missing.append("JumpServer_IP")
+    if not username:
+        missing.append("JMS_OFFICIAL_SSH_USERNAME")
+    if not password:
+        missing.append("JMS_OFFICIAL_SSH_PASSWORD")
+    if missing:
+        raise JumpServerApiError(
+            "当前 legacy 正式巡检已切到 official 引擎，请先补齐配置："
+            + ", ".join(missing)
+        )
+
+    try:
+        port_value = int(str(port).strip())
+    except ValueError as exc:
+        raise JumpServerApiError(f"`JMS_OFFICIAL_SSH_PORT={port}` 不是有效端口。") from exc
+
+    if privilege_type not in ("", "su -", "sudo"):
+        raise JumpServerApiError("`JMS_OFFICIAL_PRIVILEGE_TYPE` 仅支持空值、`su -` 或 `sudo`。")
+    if privilege_type == "su -" and not privilege_password:
+        raise JumpServerApiError("当前配置了 `JMS_OFFICIAL_PRIVILEGE_TYPE=su -`，请同时补齐 `JMS_OFFICIAL_PRIVILEGE_PASSWORD`。")
+
+    return {
+        "host": host,
+        "port": port_value,
+        "username": username,
+        "password": password,
+        "privilege_type": privilege_type,
+        "privilege_password": privilege_password,
+        "remote_config_path": remote_config_path,
+    }
+
+
+def yaml_quote(value: Any) -> str:
+    return json.dumps(str(value or ""), ensure_ascii=False)
+
+
+def render_official_machine_config(profile_name: str, ssh_config: Dict[str, Any]) -> str:
+    lines = [
+        "servers:",
+        f"  - name: {yaml_quote(profile_name or ssh_config['host'])}",
+        "    type: JumpServer",
+        f"    host: {yaml_quote(ssh_config['host'])}",
+        f"    port: {ssh_config['port']}",
+        f"    username: {yaml_quote(ssh_config['username'])}",
+        f"    password: {yaml_quote(ssh_config['password'])}",
+        '    ssh_key_path: ""',
+        f"    privilege_type: {yaml_quote(ssh_config['privilege_type'])}",
+        f"    privilege_password: {yaml_quote(ssh_config['privilege_password'])}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def resolve_service_host_info() -> Dict[str, str]:
@@ -1865,14 +2080,17 @@ def ensure_dependency_group(group: str) -> Dict[str, Any]:
         if shutil.which(package):
             continue
         installed_system.append(install_system_package(package))
-    for step in spec["post_install"]:
-        run_subprocess(
-            [str(python_path), *step],
-            f"执行 `{group}` 后置安装",
-            retries=DEFAULT_INSTALL_RETRIES,
-            env=install_env,
-        )
-        post_steps.append(" ".join(step))
+    if group == "exec":
+        post_steps.extend(install_playwright_chromium_runtime(python_path, install_env))
+    else:
+        for step in spec["post_install"]:
+            run_subprocess(
+                [str(python_path), *step],
+                f"执行 `{group}` 后置安装",
+                retries=DEFAULT_INSTALL_RETRIES,
+                env=install_env,
+            )
+            post_steps.append(" ".join(step))
 
     bootstrap_runtime_site_packages()
     if group == "exec":
@@ -1968,12 +2186,28 @@ def launch_chromium(playwright: Any):
     except Exception as exc:  # noqa: BLE001
         if not is_missing_playwright_browser_error(exc):
             raise
+        system_browser = find_system_chromium_executable()
+        if system_browser:
+            try:
+                return playwright.chromium.launch(executable_path=system_browser, headless=True)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             maybe_auto_install("exec")
-            return playwright.chromium.launch(headless=True)
+            try:
+                return playwright.chromium.launch(headless=True)
+            except Exception as retry_exc:  # noqa: BLE001
+                if not is_missing_playwright_browser_error(retry_exc):
+                    raise
+                system_browser = find_system_chromium_executable()
+                if system_browser:
+                    return playwright.chromium.launch(executable_path=system_browser, headless=True)
+                raise
         except Exception as install_exc:  # noqa: BLE001
             raise JumpServerApiError(
-                "命令执行依赖 Chromium 浏览器，请先执行 `python3 scripts/jms_inspection.py bootstrap --profile <profile>` 或 `python3 scripts/jms_inspection.py ensure-deps exec`；若下载超时，请补充代理或 `PLAYWRIGHT_DOWNLOAD_HOST` 后重试。"
+                "命令执行依赖 Chromium 浏览器。脚本已优先尝试系统 Chrome/Chromium，并会自动切换 Playwright 下载源；"
+                "若仍失败，请先安装系统 Chrome/Chromium，或补充 `PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` / 代理后重试 "
+                "`python3 scripts/jms_inspection.py ensure-deps exec`。"
             ) from install_exc
 
 
@@ -1985,6 +2219,208 @@ def ensure_command_runtime_ready() -> None:
         browser = launch_chromium(playwright)
         browser.close()
     RUNTIME_PROFILE["command_runtime_ready"] = True
+
+
+def get_paramiko_module():
+    try:
+        return importlib.import_module("paramiko")
+    except Exception as exc:  # noqa: BLE001
+        try:
+            maybe_auto_install("official")
+            return importlib.import_module("paramiko")
+        except Exception as install_exc:  # noqa: BLE001
+            raise JumpServerApiError("official 巡检依赖 paramiko，请先安装可用环境后重试。") from install_exc
+
+
+def run_remote_command(ssh_client: Any, command: str, timeout: int = 60) -> Dict[str, Any]:
+    stdin, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
+    exit_status = stdout.channel.recv_exit_status()
+    stdout_text = stdout.read().decode("utf-8", "ignore")
+    stderr_text = stderr.read().decode("utf-8", "ignore")
+    return {
+        "command": command,
+        "exit_status": exit_status,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+    }
+
+
+def format_remote_failure(result: Dict[str, Any], summary: str) -> JumpServerApiError:
+    output = "\n".join(
+        part.strip()
+        for part in (str(result.get("stdout") or ""), str(result.get("stderr") or ""))
+        if part and part.strip()
+    ).strip()
+    if output:
+        return JumpServerApiError(f"{summary}\n{output}")
+    return JumpServerApiError(summary)
+
+
+def build_official_bundle_dir(output_target: Path) -> Path:
+    bundle_dir = output_target.parent / f"{output_target.stem}_official_bundle"
+    if bundle_dir.exists():
+        shutil.rmtree(bundle_dir)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    return bundle_dir
+
+
+def run_official_legacy_probe(
+    profile_name: str,
+    output_target: Optional[Path] = None,
+    check_only: bool = False,
+) -> Dict[str, Any]:
+    ssh_config = get_official_ssh_config()
+    binary_info = prepare_official_runtime_binary()
+    paramiko = get_paramiko_module()
+    ssh_client = paramiko.SSHClient()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    remote_root = ""
+    local_bundle_dir = build_official_bundle_dir(output_target) if output_target else None
+
+    try:
+        ssh_client.connect(
+            hostname=ssh_config["host"],
+            port=int(ssh_config["port"]),
+            username=ssh_config["username"],
+            password=ssh_config["password"],
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+
+        platform_result = run_remote_command(ssh_client, "uname -s && uname -m", timeout=15)
+        if platform_result["exit_status"] != 0:
+            raise format_remote_failure(platform_result, "获取远端平台信息失败。")
+        platform_lines = [line.strip() for line in platform_result["stdout"].splitlines() if line.strip()]
+        remote_system = platform_lines[0].lower() if platform_lines else ""
+        remote_arch = platform_lines[1].lower() if len(platform_lines) > 1 else ""
+        if remote_system != OFFICIAL_REMOTE_SYSTEM or remote_arch not in OFFICIAL_REMOTE_ARCHES:
+            raise JumpServerApiError(
+                f"official 巡检当前仅支持远端 {OFFICIAL_REMOTE_SYSTEM} amd64，检测到远端平台为 {remote_system or '-'} / {remote_arch or '-'}。"
+            )
+
+        config_path = ssh_config["remote_config_path"]
+        config_check = run_remote_command(
+            ssh_client,
+            f"test -f {shlex.quote(config_path)} && echo __JMS_CONFIG_OK__",
+            timeout=15,
+        )
+        config_exists = "__JMS_CONFIG_OK__" in config_check["stdout"]
+        if config_check["exit_status"] != 0 or not config_exists:
+            raise JumpServerApiError(f"远端未找到 JumpServer 配置文件：{config_path}")
+
+        temp_result = run_remote_command(ssh_client, "mktemp -d /tmp/jms-official-XXXXXX", timeout=15)
+        if temp_result["exit_status"] != 0:
+            raise format_remote_failure(temp_result, "创建远端临时目录失败。")
+        remote_root = temp_result["stdout"].strip().splitlines()[-1]
+        remote_binary = f"{remote_root}/jms_inspect"
+        remote_machine_file = f"{remote_root}/machine.yml"
+        remote_output_dir = f"{remote_root}/output"
+
+        sftp = ssh_client.open_sftp()
+        try:
+            sftp.put(binary_info["runtime_path"], remote_binary)
+            with sftp.open(remote_machine_file, "w") as remote_file:
+                remote_file.write(render_official_machine_config(profile_name, ssh_config))
+        finally:
+            sftp.close()
+
+        chmod_result = run_remote_command(
+            ssh_client,
+            f"chmod 755 {shlex.quote(remote_binary)} && mkdir -p {shlex.quote(remote_output_dir)}",
+            timeout=30,
+        )
+        if chmod_result["exit_status"] != 0:
+            raise format_remote_failure(chmod_result, "准备远端 official 巡检运行目录失败。")
+
+        command_parts = [
+            shlex.quote(remote_binary),
+            "-jc", shlex.quote(config_path),
+            "-mt", shlex.quote(remote_machine_file),
+            "-output-dir", shlex.quote(remote_output_dir),
+            "-silent",
+            "-auto-approve",
+        ]
+        if check_only:
+            command_parts.append("-check-only")
+        execute_result = run_remote_command(ssh_client, " ".join(command_parts), timeout=1800)
+        if execute_result["exit_status"] != 0:
+            raise format_remote_failure(execute_result, "执行 official 巡检失败。")
+
+        payload: Dict[str, Any] = {
+            "binary": binary_info,
+            "remote_root": remote_root,
+            "remote_output_dir": remote_output_dir,
+            "remote_platform": {
+                "system": remote_system,
+                "arch": remote_arch,
+            },
+            "remote_config_path": config_path,
+            "check_only": check_only,
+            "stdout": execute_result["stdout"],
+            "stderr": execute_result["stderr"],
+        }
+        if check_only:
+            return payload
+
+        if local_bundle_dir is None:
+            raise JumpServerApiError("official 巡检缺少本地 bundle 输出目录。")
+
+        sftp = ssh_client.open_sftp()
+        downloaded_files: List[str] = []
+        html_file: Optional[Path] = None
+        json_file: Optional[Path] = None
+        excel_file: Optional[Path] = None
+        try:
+            for entry in sftp.listdir_attr(remote_output_dir):
+                remote_path = f"{remote_output_dir}/{entry.filename}"
+                local_path = local_bundle_dir / entry.filename
+                sftp.get(remote_path, str(local_path))
+                downloaded_files.append(str(local_path))
+                suffix = local_path.suffix.lower()
+                if suffix == ".html":
+                    html_file = local_path
+                elif suffix == ".json":
+                    json_file = local_path
+                elif suffix in (".xlsx", ".xls"):
+                    excel_file = local_path
+        finally:
+            sftp.close()
+
+        if html_file is None or not html_file.exists():
+            raise JumpServerApiError("official 巡检已执行，但未回收到 HTML 报告。")
+
+        metadata = {
+            "provider": "official",
+            "profile_name": profile_name,
+            "remote_host": ssh_config["host"],
+            "remote_platform": payload["remote_platform"],
+            "remote_config_path": config_path,
+            "remote_root": remote_root,
+            "downloaded_files": downloaded_files,
+        }
+        (local_bundle_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload.update({
+            "bundle_dir": str(local_bundle_dir),
+            "downloaded_files": downloaded_files,
+            "html_file": str(html_file),
+            "json_file": str(json_file) if json_file else None,
+            "excel_file": str(excel_file) if excel_file else None,
+            "html_text": html_file.read_text(encoding="utf-8", errors="ignore"),
+        })
+        return payload
+    finally:
+        if remote_root:
+            try:
+                run_remote_command(ssh_client, f"rm -rf {shlex.quote(remote_root)}", timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            ssh_client.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def capture_terminal_text(page: Any) -> str:
@@ -6925,17 +7361,22 @@ def build_report_artifact(
     profile_name, _ = activate_profile(profile)
     date_from = date_from or report_date
     date_to = date_to or report_date
+    target = resolve_output_file(output_file, report_format=report_format, profile_name=profile_name, legacy=legacy)
 
     if report_format == "html":
         if style == "legacy":
-            report_text = render_legacy_html_report(
-                report_date,
-                profile_name,
-                org_name=org_name,
-                all_orgs=all_orgs,
-                date_from=date_from,
-                date_to=date_to,
-            )
+            if get_legacy_provider() == "official":
+                official_payload = run_official_legacy_probe(profile_name, output_target=target, check_only=False)
+                report_text = str(official_payload.get("html_text") or "")
+            else:
+                report_text = render_legacy_html_report(
+                    report_date,
+                    profile_name,
+                    org_name=org_name,
+                    all_orgs=all_orgs,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
         else:
             report_text = render_html_report(
                 report_date,
@@ -6959,7 +7400,6 @@ def build_report_artifact(
         mode = detect_template_mode(template_text)
         report_text = render_placeholder_template(template_text, context) if mode == "placeholder" else render_natural_language_template(template_text, context)
 
-    target = resolve_output_file(output_file, report_format=report_format, profile_name=profile_name, legacy=legacy)
     return report_text, output_report(report_text, output_file=target, report_format=report_format, print_stdout=True)
 
 
@@ -7118,8 +7558,9 @@ def cmd_list_orgs(args: argparse.Namespace) -> int:
 
 def cmd_self_test(args: argparse.Namespace) -> int:
     try:
-        activate_profile(args.profile)
+        profile_name, _ = activate_profile(args.profile)
         cfg = get_env_config()
+        legacy_provider = get_legacy_provider()
         scopes = resolve_org_scopes(org_name=args.org_name, all_orgs=args.all_orgs)
         org_id = scopes[0]["id"] if len(scopes) == 1 else None
         assets, assets_error = safe_fetch(lambda: get_assets(org_id=org_id), "资产接口不可用")
@@ -7129,39 +7570,71 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         command_state = get_command_target_state()
         command_targets = command_state.get("targets", [])
         command_error = get_command_execution_error(command_targets)
-        legacy_state = get_legacy_system_target_state()
-        legacy_targets = legacy_state.get("targets", [])
         legacy_remote_config_ready = False
-        legacy_remote_config_error = legacy_state.get("error")
+        legacy_remote_config_error = None
         legacy_db_ready = False
         legacy_db_error = None
         legacy_db_config = None
-        if legacy_targets and not legacy_state.get("error"):
-            evidence = collect_command_evidence([legacy_targets[0]])
-            if evidence and evidence[0].get("status") == "ok":
-                snapshot = parse_system_target_snapshot(legacy_targets[0], evidence[0])
-                try:
-                    resolved_db = resolve_legacy_db_config([snapshot])
-                    execute_sql_row(resolved_db, "rds_status.sql", {})
-                    legacy_remote_config_ready = bool(snapshot.get("remote_config_text") or resolved_db.get("source") == "local_override")
-                    legacy_db_ready = True
-                    legacy_db_config = {
-                        "engine": resolved_db.get("engine"),
-                        "host": resolved_db.get("host"),
-                        "port": resolved_db.get("port"),
-                        "name": resolved_db.get("name"),
-                        "source": resolved_db.get("source"),
-                    }
-                except Exception as exc:  # noqa: BLE001
-                    legacy_db_error = str(exc)
-                    if "config" in str(exc).lower():
-                        legacy_remote_config_error = str(exc)
-            else:
-                legacy_remote_config_error = humanize_value(evidence[0].get("error") if evidence else legacy_state.get("error"), default="远程命令执行失败")
+        legacy_state: Dict[str, Any] = {"targets": [], "resolution_mode": None, "error": None}
+        legacy_targets: List[Dict[str, Any]] = []
+        if legacy_provider == "python":
+            legacy_state = get_legacy_system_target_state()
+            legacy_targets = legacy_state.get("targets", [])
+            legacy_remote_config_error = legacy_state.get("error")
+            if legacy_targets and not legacy_state.get("error"):
+                evidence = collect_command_evidence([legacy_targets[0]])
+                if evidence and evidence[0].get("status") == "ok":
+                    snapshot = parse_system_target_snapshot(legacy_targets[0], evidence[0])
+                    try:
+                        resolved_db = resolve_legacy_db_config([snapshot])
+                        execute_sql_row(resolved_db, "rds_status.sql", {})
+                        legacy_remote_config_ready = bool(snapshot.get("remote_config_text") or resolved_db.get("source") == "local_override")
+                        legacy_db_ready = True
+                        legacy_db_config = {
+                            "engine": resolved_db.get("engine"),
+                            "host": resolved_db.get("host"),
+                            "port": resolved_db.get("port"),
+                            "name": resolved_db.get("name"),
+                            "source": resolved_db.get("source"),
+                        }
+                    except Exception as exc:  # noqa: BLE001
+                        legacy_db_error = str(exc)
+                        if "config" in str(exc).lower():
+                            legacy_remote_config_error = str(exc)
+                else:
+                    legacy_remote_config_error = humanize_value(evidence[0].get("error") if evidence else legacy_state.get("error"), default="远程命令执行失败")
+
+        official_binary_ready = False
+        official_binary_error = None
+        official_binary_info: Dict[str, Any] = {}
+        official_ssh_ready = False
+        official_ssh_error = None
+        official_ssh_config: Dict[str, Any] = {}
+        official_probe_ready = False
+        official_probe_error = None
+        official_probe: Dict[str, Any] = {}
+        try:
+            official_binary_info = prepare_official_runtime_binary()
+            official_binary_ready = True
+        except Exception as exc:  # noqa: BLE001
+            official_binary_error = str(exc)
+        try:
+            official_ssh_config = get_official_ssh_config()
+            official_ssh_ready = True
+        except Exception as exc:  # noqa: BLE001
+            official_ssh_error = str(exc)
+        if official_binary_ready and official_ssh_ready:
+            try:
+                official_probe = run_official_legacy_probe(profile_name, check_only=True)
+                official_probe_ready = True
+            except Exception as exc:  # noqa: BLE001
+                official_probe_error = str(exc)
+
         result = {
             "profile": args.profile or RUNTIME_PROFILE.get("name"),
             "date": args.date or today_str(),
             "org_scope": scope_label(scopes),
+            "legacy_provider": legacy_provider,
             "auth_mode": cfg.get("auth_mode"),
             "auth_source": cfg.get("auth_source"),
             "access_key_ready": bool(cfg.get("key_id") and cfg.get("secret_id")),
@@ -7183,6 +7656,17 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "legacy_db_ready": legacy_db_ready,
             "legacy_db_error": legacy_db_error,
             "legacy_db_config": legacy_db_config,
+            "official_binary_ready": official_binary_ready,
+            "official_binary_error": official_binary_error,
+            "official_binary_source": official_binary_info.get("source"),
+            "official_runtime_binary": official_binary_info.get("runtime_path"),
+            "official_ssh_ready": official_ssh_ready,
+            "official_ssh_error": official_ssh_error,
+            "official_ssh_target": f"{official_ssh_config.get('username', '')}@{official_ssh_config.get('host', '')}:{official_ssh_config.get('port', '')}" if official_ssh_config else None,
+            "official_remote_config_path": official_ssh_config.get("remote_config_path") if official_ssh_config else None,
+            "official_check_only_ready": official_probe_ready,
+            "official_check_only_error": official_probe_error,
+            "official_remote_platform": official_probe.get("remote_platform"),
             "assets_error": assets_error,
             "active_sessions_error": sessions_error,
             "login_logs_error": logins_error,
@@ -7199,7 +7683,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             healthy = False
         if command_targets and command_error:
             healthy = False
-        if legacy_state.get("error") or (legacy_targets and (not legacy_remote_config_ready or not legacy_db_ready)):
+        if legacy_provider == "python" and (legacy_state.get("error") or (legacy_targets and (not legacy_remote_config_ready or not legacy_db_ready))):
+            healthy = False
+        if legacy_provider == "official" and (not official_binary_ready or not official_ssh_ready or not official_probe_ready):
             healthy = False
         return 0 if healthy else 1
     except Exception as exc:  # noqa: BLE001
@@ -7324,7 +7810,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             profile_path, created_profile = ensure_profile_from_example(args.profile, overwrite=args.overwrite_profile)
             activate_profile(args.profile)
 
-        groups = ["db", "exec", "docx"]
+        groups = ["db", "exec", "docx", "official"]
         if args.include_pdf:
             groups.append("pdf")
         deps_result = bootstrap_dependency_groups(groups)
@@ -7338,20 +7824,36 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             command_runtime_error = str(exc)
 
+        official_binary_ready = False
+        official_binary_error = None
+        official_binary_info: Dict[str, Any] = {}
+        try:
+            official_binary_info = prepare_official_runtime_binary()
+            official_binary_ready = True
+        except Exception as exc:  # noqa: BLE001
+            official_binary_error = str(exc)
+
         payload = {
             "profile": args.profile,
             "profile_file": str(profile_path) if profile_path else None,
             "profile_created": created_profile,
+            "legacy_provider": get_legacy_provider(),
             "pending_profile_keys": pending_profile_keys,
             "dependency_groups": groups,
             "dependencies": deps_result,
             "command_runtime_ready": command_runtime_ready,
             "command_runtime_error": command_runtime_error,
+            "official_binary_ready": official_binary_ready,
+            "official_binary_error": official_binary_error,
+            "official_binary_source": official_binary_info.get("source"),
+            "official_runtime_binary": official_binary_info.get("runtime_path"),
             "playwright_browsers_path": str(PLAYWRIGHT_BROWSERS_DIR),
             "notes": [
-                "bootstrap 默认安装 db+exec+docx，避免 fresh install 一上来就被 pdf/libreoffice 阻塞。",
+                "bootstrap 默认安装 db+exec+docx+official，避免 fresh install 一上来就被按需补依赖打断。",
                 "如需 PDF 模板补全，再追加 --include-pdf 或单独执行 ensure-deps pdf。",
                 "playwright/chromium 浏览器缓存默认落在 runtime/.playwright-browsers，避免依赖用户全局缓存目录。",
+                "exec 依赖现在会优先复用系统 Chrome/Chromium；只有本机没有可用浏览器时才尝试下载 Playwright Chromium，并会自动切换下载源。",
+                "legacy 正式完整版默认走 official 引擎，需要额外补齐 JumpServer_IP、JMS_OFFICIAL_SSH_USERNAME、JMS_OFFICIAL_SSH_PASSWORD。",
             ],
             "next_steps": [
                 f"编辑 {profile_path} 补齐 {', '.join(pending_profile_keys)}" if profile_path and pending_profile_keys else "",
@@ -7360,8 +7862,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             ],
         }
         payload["next_steps"] = [item for item in payload["next_steps"] if item]
+        critical_failed_groups = [group for group in deps_result.get("failed_groups", []) if group != "exec"]
+        if "exec" in deps_result.get("failed_groups", []):
+            payload["notes"].append("exec 浏览器运行时暂未就绪，但不会阻塞 official legacy 正式报告、模板补全和大多数分析链路。")
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0 if command_runtime_ready and not deps_result.get("failed_groups") else 1
+        return 0 if official_binary_ready and not critical_failed_groups else 1
     except Exception as exc:  # noqa: BLE001
         print(str(exc) or DEFAULT_ERROR_MESSAGE, file=sys.stderr)
         return 1
@@ -7376,7 +7881,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="JumpServer 巡检报告生成与定时推送工具")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_bootstrap = sub.add_parser("bootstrap", help="首次安装自举：准备 profile、运行时依赖与命令执行环境")
+    p_bootstrap = sub.add_parser("bootstrap", help="首次安装自举：准备 profile、运行时依赖、命令执行环境与 official 巡检引擎")
     p_bootstrap.add_argument("--profile", help="环境 profile 名称或 env 文件路径；传入时不存在则自动从 .env.example 创建")
     p_bootstrap.add_argument("--overwrite-profile", action="store_true", help="若 profile 已存在，允许用 .env.example 覆盖")
     p_bootstrap.add_argument("--include-pdf", action="store_true", help="额外安装 PDF 模板补全依赖，可能触发 libreoffice 安装")
@@ -7390,7 +7895,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--output-file", help="输出文件路径；留空时写入 runtime/reports/<profile>/")
     p_report.add_argument("--from", dest="from_date", help="报告开始日期，格式 YYYY-MM-DD；留空时按单日报告处理")
     p_report.add_argument("--to", dest="to_date", help="报告结束日期，格式 YYYY-MM-DD；留空时默认等于位置参数 date")
-    p_report.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为正式完整版，modern 为控制台摘要版")
+    p_report.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为 official 正式完整版，modern 为控制台摘要版")
     add_org_scope_args(p_report)
     p_report.set_defaults(func=cmd_report)
 
@@ -7402,7 +7907,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_generate.add_argument("--output-file", help="输出文件路径；留空时写入 runtime/last_report.md 或 runtime/last_report.html")
     p_generate.add_argument("--from", dest="from_date", help="报告开始日期，格式 YYYY-MM-DD；留空时按单日报告处理")
     p_generate.add_argument("--to", dest="to_date", help="报告结束日期，格式 YYYY-MM-DD；留空时默认等于 --date 或今天")
-    p_generate.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为正式完整版，modern 为控制台摘要版")
+    p_generate.add_argument("--style", choices=("modern", "legacy"), default=get_runtime_env("JMS_REPORT_STYLE", DEFAULT_REPORT_STYLE) or DEFAULT_REPORT_STYLE, help="HTML 报告样式：legacy 为 official 正式完整版，modern 为控制台摘要版")
     add_org_scope_args(p_generate)
     p_generate.set_defaults(func=cmd_generate)
 
@@ -7431,7 +7936,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fill.set_defaults(func=cmd_fill_template)
 
     p_deps = sub.add_parser("ensure-deps", help="安装缺失的可选依赖")
-    p_deps.add_argument("target", choices=("db", "exec", "docx", "pdf", "all"))
+    p_deps.add_argument("target", choices=("db", "exec", "docx", "official", "pdf", "all"))
     p_deps.set_defaults(func=cmd_ensure_deps)
 
     p_save = sub.add_parser("save-template", help="保存模板")
@@ -7482,7 +7987,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_token.add_argument("--profile", help="环境 profile 名称或 env 文件路径")
     p_token.set_defaults(func=cmd_update_token)
 
-    p_self_test = sub.add_parser("self-test", help="自测 JumpServer 接口连通性与关键字段")
+    p_self_test = sub.add_parser("self-test", help="自测 JumpServer 接口、命令执行链路与 official legacy 巡检能力")
     p_self_test.add_argument("--date", help="报告日期，格式 YYYY-MM-DD")
     p_self_test.add_argument("--profile", help="环境 profile 名称或 env 文件路径")
     add_org_scope_args(p_self_test)

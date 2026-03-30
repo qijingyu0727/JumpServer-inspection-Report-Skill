@@ -26,8 +26,9 @@
 - 或执行 `python3 scripts/jms_inspection.py ensure-deps all`
 - 或执行 `python3 -m playwright install chromium`
 - 若开启了 `JMS_AUTO_INSTALL=true`，脚本会先尝试恢复 `runtime/.venv` 里的 pip，再自动补装依赖
+- 脚本会优先复用系统 Chrome/Chromium；若本机没有浏览器，才会下载 Playwright Chromium
 - Chromium 默认下载到 `runtime/.playwright-browsers`
-- 若浏览器下载超时，优先在 profile 中补 `HTTPS_PROXY/HTTP_PROXY` 或 `PLAYWRIGHT_DOWNLOAD_HOST` 后重新执行 `bootstrap`
+- 若浏览器下载超时，优先在 profile 中补 `HTTPS_PROXY/HTTP_PROXY` 或 `PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` 后重新执行 `bootstrap`
 
 ## 数据库连接失败
 
@@ -41,6 +42,23 @@
 - 先执行 `python3 -m pip install -r requirements.txt`
 - 或执行 `python3 scripts/jms_inspection.py ensure-deps db`
 - 若仍失败，重点检查 DB 账号鉴权方式和 `DB_* / JMS_DB_*` 配置
+
+## official legacy 巡检失败
+
+现象：
+
+- `report ... html --style legacy` 提示缺少 `JMS_OFFICIAL_SSH_USERNAME` / `JMS_OFFICIAL_SSH_PASSWORD`
+- `self-test` 中 `official_binary_ready`、`official_ssh_ready` 或 `official_check_only_ready` 为 `false`
+- 报告能生成但没有官方 HTML/JSON/Excel bundle
+
+处理：
+
+- fresh install 先执行 `python3 scripts/jms_inspection.py bootstrap --profile prod`
+- 单独补装 official 依赖时执行 `python3 scripts/jms_inspection.py ensure-deps official`
+- 确认 profile 中至少补齐 `JumpServer_IP`、`JMS_OFFICIAL_SSH_USERNAME`、`JMS_OFFICIAL_SSH_PASSWORD`
+- 再执行 `python3 scripts/jms_inspection.py self-test --profile prod --date 2026-03-26`
+- 若 `official_check_only_error` 提示远端配置文件不存在，检查 `JMS_OFFICIAL_REMOTE_CONFIG_PATH`
+- 若目标环境暂时无法走 official 远程巡检，可临时设置 `JMS_LEGACY_PROVIDER=python` 回退旧链路
 
 ## 模板补全失败
 

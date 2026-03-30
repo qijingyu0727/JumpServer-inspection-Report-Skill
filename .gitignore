@@ -24,3 +24,6 @@ runtime/*
 !runtime/profiles/
 !runtime/profiles/.gitkeep
 runtime/profiles/*.env
+
+# Vendored upstream build cache
+third_party/jms-inspect-go/.build/
