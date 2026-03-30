@@ -1,12 +1,26 @@
 # 模板与补全规则
 
+模板能力仍保留，但它是显式高级能力，不是正式巡检报告默认路径。
+
+## 何时允许使用模板能力
+
+- 只有用户明确提到以下关键词时，才允许走模板链路：
+  - `模板`
+  - `Word`
+  - `PDF`
+  - `doc`
+  - `docx`
+  - `补全文档`
+- 用户只是说 `巡检报告/日报/月报/legacy 报告` 时，不要默认走模板。
+- 默认正式报告路径仍应是 official `legacy` HTML。
+
 ## Markdown 模板
 
 | 来源 | 路径 | 用途 |
 |---|---|---|
 | 用户模板 | `runtime/template.md` | `save-template` 默认写入位置 |
-| 内置日报模板 | `assets/templates/daily.md` | 默认巡检日报 |
-| 内置管理摘要模板 | `assets/templates/executive.md` | 管理层摘要 |
+| 内置日报模板 | `assets/templates/daily.md` | 显式 Markdown 日报模板 |
+| 内置管理摘要模板 | `assets/templates/executive.md` | 显式管理摘要模板 |
 
 默认优先级：
 
@@ -50,4 +64,5 @@ runtime/template.md -> assets/templates/daily.md
 python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.docx --org-name 生产组织
 python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.doc --output-file /tmp/report_filled.docx
 python3 scripts/jms_inspection.py fill-template --profile prod --from 2026-03-01 --to 2026-03-20 --input-file /path/to/report.pdf --all-orgs
+python3 scripts/jms_inspection.py generate --profile prod --date 2026-03-20 --format markdown --template-file daily
 ```

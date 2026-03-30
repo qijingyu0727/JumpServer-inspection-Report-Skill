@@ -12,9 +12,12 @@
   - `JMS_OFFICIAL_SSH_PASSWORD`
 - 首次把追问得到的配置写回 env/profile：
   - `python3 scripts/jms_inspection.py save-config --profile <profile> KEY=VALUE [KEY=VALUE ...]`
-- 正式报告：
-  - `bin/jms-report <profile> <date> <format>`
-  - `python3 scripts/jms_inspection.py report <profile> <date> <format> [--from <YYYY-MM-DD>] [--to <YYYY-MM-DD>] [--style modern|legacy] [--org-name <名称> | --all-orgs]`
+- 正式报告默认入口：
+  - `bin/jms-report <profile> <date> html`
+  - `python3 scripts/jms_inspection.py report <profile> <date> html [--from <YYYY-MM-DD>] [--to <YYYY-MM-DD>] [--style modern|legacy] [--org-name <名称> | --all-orgs]`
+- 兼容入口：
+  - `python3 scripts/jms_inspection.py generate --profile <profile> --date <YYYY-MM-DD>`
+  - 该入口现在默认也输出 official HTML 正式报告，不再默认输出 Markdown 模板
 - Fresh install 自举：
   - `python3 scripts/jms_inspection.py bootstrap --profile <profile>`
   - `python3 scripts/jms_inspection.py bootstrap --profile <profile> --include-pdf`
@@ -24,9 +27,16 @@
   - `python3 scripts/jms_inspection.py analyze --profile <profile> --from <YYYY-MM-DD> --to <YYYY-MM-DD> --type login-anomalies|top-users|top-assets|host-usage [--host <资产/IP>] [--top <N>] [--org-name <名称> | --all-orgs]`
 - 模板补全：
   - `python3 scripts/jms_inspection.py fill-template --profile <profile> --from <YYYY-MM-DD> --to <YYYY-MM-DD> --input-file <doc|docx|pdf> [--output-file ...]`
-- 依赖安装：
-  - `python3 scripts/jms_inspection.py ensure-deps db|exec|docx|official|pdf|all`
-  - fresh install 更推荐先执行 `python3 scripts/jms_inspection.py bootstrap --profile <profile>`
+  - 仅在用户明确提到 `模板/Word/PDF/doc/docx` 时使用
+
+## 正式报告默认行为
+
+- `report ... html` 默认输出 official `legacy` 正式巡检完整版。
+- `legacy` 默认走 `JMS_LEGACY_PROVIDER=official`。
+- official 巡检二进制默认从 `assets/bin/linux_amd64/jms_inspect` 准备到 `runtime/bin/jms_inspect`。
+- 正式报告默认通过 SSH 在 JumpServer 主机上远程执行 official `jms-inspect-go`，并从远端 `/opt/jumpserver/config/config.txt` 读取数据库配置，除非本地显式提供 `DB_* / JMS_DB_*` 覆盖。
+- 如果 official SSH 信息或 JumpServer 节点信息缺失，必须先补齐，不要退回模板 Markdown 冒充正式报告。
+- `report ... html --style modern` 仅用于控制台摘要版或移动端简报版。
 
 ## 组织范围规则
 
@@ -53,11 +63,9 @@
 - official legacy 远程执行依赖 `paramiko`
 - Playwright 浏览器缓存默认安装到 `runtime/.playwright-browsers`
 - `.doc` 转 `.docx` 依赖 `libreoffice/soffice`
-- `legacy` 默认走 `JMS_LEGACY_PROVIDER=official`
-- official 巡检二进制默认从 `assets/bin/linux_amd64/jms_inspect` 准备到 `runtime/bin/jms_inspect`
 - 数据库查询依赖 `PyMySQL[rsa]`；若目标库使用 MySQL 8 默认鉴权，还依赖 `cryptography`
-- `bootstrap` 默认安装 `db + exec + docx + official`，避免第一次执行时再按需补装
-- fresh install 的依赖恢复默认带重试和更长浏览器下载超时；若环境出网受限，可在 profile 里补 `HTTPS_PROXY/HTTP_PROXY/PLAYWRIGHT_DOWNLOAD_HOST`
+- `bootstrap` 默认安装 `db + exec + docx + official`
+- fresh install 的依赖恢复默认带重试和更长浏览器下载超时；若环境出网受限，可在 profile 里补 `HTTPS_PROXY/HTTP_PROXY/PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST/PLAYWRIGHT_DOWNLOAD_HOST`
 - official 远程报告至少还需要 `JumpServer_IP`、`JMS_OFFICIAL_SSH_USERNAME`、`JMS_OFFICIAL_SSH_PASSWORD`
 - `JMS_OFFICIAL_SSH_PORT` 默认 `22`
 - `JMS_OFFICIAL_PRIVILEGE_TYPE` 仅支持空值、`sudo`、`su -`
@@ -67,16 +75,24 @@
 - 未配置 `JMS_SYSTEM_TARGETS` 时，会优先复用 `JumpServer_IP / JMS_EXEC_ACCOUNT_NAME`
 - 仍未配置时，才会从 `JUMPSERVER_URL` 解析域名/IP，并尝试把该服务 IP 当作默认巡检节点
 - 如果提供的是 IP 且命中多台资产，脚本会优先按 Host/Linux、URL 主机名线索、账号存在性和连通状态择优
-- 数据库连接优先级：本地显式 `DB_* / JMS_DB_*` 覆盖 > 远端 `/opt/jumpserver/config/config.txt`
-- 远端配置默认读取 `DB_ENGINE / DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME`
 
 ## 结果输出
 
 - `report ... html` 写到 `runtime/reports/<profile>/JumpServer巡检报告_<timestamp>.html`
 - official legacy 同时会在同目录生成 `JumpServer巡检报告_<timestamp>_official_bundle/`，保存回收的 HTML/JSON/Excel 与 metadata
 - `report ... markdown` 写到 `runtime/reports/<profile>/JumpServer巡检报告_<timestamp>.md`
-- `report ... html` 默认输出 official legacy 正式巡检完整版 HTML
-- `report ... html --style modern` 输出新版控制台摘要版
+- `generate` 默认输出 `runtime/last_report.html`
 - `report ... --from ... --to ...` 仍只生成一份汇总报告，不拆成多份
 - `fill-template` 默认写到 `runtime/filled_templates/`
 - `analyze` 默认直接输出 Markdown；`--format json` 时输出结构化 JSON
+
+## Fresh Install 验收
+
+- 安装完成后至少执行：
+  - `python3 scripts/jms_inspection.py self-test --profile <profile> --date <YYYY-MM-DD>`
+  - `bin/jms-report <profile> <date> html`
+- 成功标准：
+  - `official_binary_ready = true`
+  - `official_ssh_ready = true`
+  - `official_check_only_ready = true`
+  - 最终得到的是 official HTML 正式报告，而不是模板 Markdown
